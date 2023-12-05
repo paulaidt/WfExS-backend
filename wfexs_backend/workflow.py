@@ -236,6 +236,8 @@ from .fetchers.trs_files import (
 
 from .nextflow_engine import NextflowWorkflowEngine
 from .cwl_engine import CWLWorkflowEngine
+from .snakemake_engine import SnakemakeWorkflowEngine
+
 
 if TYPE_CHECKING:
     from .wfexs_backend import WfExSBackend
@@ -245,10 +247,10 @@ if TYPE_CHECKING:
 # a bit lax (only detects a couple of too common
 # keywords)
 WORKFLOW_ENGINE_CLASSES: "Final[Sequence[Type[WorkflowEngine]]]" = [
+    SnakemakeWorkflowEngine,
     CWLWorkflowEngine,
     NextflowWorkflowEngine,
 ]
-
 
 def _wakeupEncDir(
     cond: "threading.Condition", workDir: "AbsPath", logger: "logging.Logger"
