@@ -498,7 +498,10 @@ class SnakemakeWorkflowEngine(WorkflowEngine):
             return cast("WorkflowEngineVersionStr", engine_ver.strip())
 
     def materializeWorkflow(
-        self, matWorkflowEngine: "MaterializedWorkflowEngine", offline: "bool" = False
+        self,
+        matWorkflowEngine: "MaterializedWorkflowEngine",
+        consolidatedWorkflowDir: "AbsPath",
+        offline: "bool" = False,
     ) -> "Tuple[MaterializedWorkflowEngine, Sequence[ContainerTaggedName]]":
         """
         Method to ensure the workflow has been materialized. It returns the
