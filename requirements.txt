@@ -24,3 +24,4 @@ pyxdg
 groovy-parser == 0.1.1
 data-url
 pgzip
+snakemake == 7.32.3

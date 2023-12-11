@@ -17,6 +17,7 @@
 
 from __future__ import absolute_import
 
+import copy
 import datetime
 import os
 import re
@@ -49,7 +50,7 @@ from .common import (
     LocalWorkflow,
     MaterializedContent,
     MaterializedInput,
-   # MaterializedWorkflowEngine, ?? 
+    MaterializedWorkflowEngine,
     StagedExecution,
     WorkflowType,
 
@@ -150,6 +151,7 @@ class SnakemakeWorkflowEngine(WorkflowEngine):
         outputMetaDir: "Optional[AnyPath]" = None,
         intermediateDir: "Optional[AnyPath]" = None,
         tempDir: "Optional[AnyPath]" = None,
+        stagedContainersDir: "Optional[AnyPath]" = None,
         secure_exec: "bool" = False,
         allowOther: "bool" = False,
         config_directory: "Optional[AnyPath]" = None,
@@ -165,6 +167,7 @@ class SnakemakeWorkflowEngine(WorkflowEngine):
             outputsDir=outputsDir,
             intermediateDir=intermediateDir,
             tempDir=tempDir,
+            stagedContainersDir=stagedContainersDir,
             outputMetaDir=outputMetaDir,
             secure_exec=secure_exec,
             allowOther=allowOther,
@@ -439,7 +442,21 @@ class SnakemakeWorkflowEngine(WorkflowEngine):
         
     # def runSnakemakeCommand() ?
     # def runLocalSnakemakeCommand() ?
-    
+    def _get_engine_version_str(
+        self, matWfEng: "MaterializedWorkflowEngine"
+    ) -> "WorkflowEngineVersionStr":
+        assert (
+            matWfEng.instance == self
+        ), "The workflow engine instance does not match!!!!"
+
+        if self.engine_mode == EngineMode.Local:
+            return self.__get_engine_version_str_local(matWfEng)
+
+        raise WorkflowEngineException(
+            "Unsupported engine mode {} for {} engine".format(
+                self.engine_mode, self.ENGINE_NAME
+            )
+        )
 
     def __get_engine_version_str_local(
         self, matWfEng: "MaterializedWorkflowEngine"
