@@ -97,6 +97,7 @@ DEFAULT_APPTAINER_CMD = cast("SymbolicName", "apptainer")
 DEFAULT_PODMAN_CMD = cast("SymbolicName", "podman")
 DEFAULT_JAVA_CMD = cast("SymbolicName", "java")
 DEFAULT_FUSERMOUNT_CMD = cast("SymbolicName", "fusermount")
+DEFAULT_DOT_CMD = cast("SymbolicName", "dot")
 
 if TYPE_CHECKING:
     ProgsMapping: TypeAlias = MutableMapping[SymbolicName, AnyPath]
@@ -108,6 +109,7 @@ DEFAULT_PROGS: "ProgsMapping" = {
     DEFAULT_PODMAN_CMD: cast("RelPath", DEFAULT_PODMAN_CMD),
     DEFAULT_JAVA_CMD: cast("RelPath", DEFAULT_JAVA_CMD),
     DEFAULT_FUSERMOUNT_CMD: cast("RelPath", DEFAULT_FUSERMOUNT_CMD),
+    DEFAULT_DOT_CMD: cast("RelPath", DEFAULT_DOT_CMD),
 }
 
 
@@ -266,108 +268,10 @@ class Attribution(NamedTuple):
         return attributions
 
 
-# Licences
-AcceptableLicenceSchemes: "Final[Set[str]]" = {
-    "ftp",
-    "http",
-    "https",
-    "data",
-}
 NoLicence: "Final[URIType]" = cast(
     "URIType", "https://choosealicense.com/no-permission/"
 )
 DefaultNoLicenceTuple: "Tuple[URIType, ...]" = (NoLicence,)
-
-# According to Workflow RO-Crate, this is the term for no license (or not specified)
-NoLicenceShort: "Final[str]" = "notspecified"
-
-# The correspondence from short Workflow RO-Crate licences and their URIs
-# taken from https://about.workflowhub.eu/Workflow-RO-Crate/#supported-licenses
-ROCrateShortLicences: "Final[Mapping[str, str]]" = {
-    "AFL-3.0": "https://opensource.org/licenses/AFL-3.0",  # - Academic Free License 3.0
-    "APL-1.0": "https://opensource.org/licenses/APL-1.0",  # - Adaptive Public License 1.0
-    "Apache-1.1": "https://opensource.org/licenses/Apache-1.1",  # - Apache Software License 1.1
-    "Apache-2.0": "https://opensource.org/licenses/Apache-2.0",  # - Apache Software License 2.0
-    "APSL-2.0": "https://opensource.org/licenses/APSL-2.0",  # - Apple Public Source License 2.0
-    "Artistic-2.0": "https://opensource.org/licenses/Artistic-2.0",  # - Artistic License 2.0
-    "AAL": "https://opensource.org/licenses/AAL",  # - Attribution Assurance Licenses
-    "BSD-2-Clause": "https://opensource.org/licenses/BSD-2-Clause",  # - BSD 2-Clause “Simplified” or “FreeBSD” License (BSD-2-Clause)
-    "BSD-3-Clause": "https://opensource.org/licenses/BSD-3-Clause",  # - BSD 3-Clause “New” or “Revised” License (BSD-3-Clause)
-    "BitTorrent-1.1": "https://spdx.org/licenses/BitTorrent-1.1",  # - BitTorrent Open Source License 1.1
-    "BSL-1.0": "https://opensource.org/licenses/BSL-1.0",  # - Boost Software License 1.0
-    "CC0-1.0": "https://creativecommons.org/publicdomain/zero/1.0/",  # - CC0 1.0
-    "CNRI-Python": "https://opensource.org/licenses/CNRI-Python",  # - CNRI Python License
-    "CUA-OPL-1.0": "https://opensource.org/licenses/CUA-OPL-1.0",  # - CUA Office Public License 1.0
-    "CECILL-2.1": "https://opensource.org/licenses/CECILL-2.1",  # - CeCILL License 2.1
-    "CDDL-1.0": "https://opensource.org/licenses/CDDL-1.0",  # - Common Development and Distribution License 1.0
-    "CPAL-1.0": "https://opensource.org/licenses/CPAL-1.0",  # - Common Public Attribution License 1.0
-    "CATOSL-1.1": "https://opensource.org/licenses/CATOSL-1.1",  # - Computer Associates Trusted Open Source License 1.1 (CATOSL-1.1)
-    "EUDatagrid": "https://opensource.org/licenses/EUDatagrid",  # - EU DataGrid Software License
-    "EPL-1.0": "https://opensource.org/licenses/EPL-1.0",  # - Eclipse Public License 1.0
-    "ECL-2.0": "https://opensource.org/licenses/ECL-2.0",  # - Educational Community License 2.0
-    "EFL-2.0": "https://opensource.org/licenses/EFL-2.0",  # - Eiffel Forum License 2.0
-    "Entessa": "https://opensource.org/licenses/Entessa",  # - Entessa Public License
-    "EUPL-1.1": "https://opensource.org/licenses/EUPL-1.1",  # - European Union Public License 1.1
-    "Fair": "https://opensource.org/licenses/Fair",  # - Fair License
-    "Frameworx-1.0": "https://opensource.org/licenses/Frameworx-1.0",  # - Frameworx License 1.0
-    "AGPL-3.0": "https://opensource.org/licenses/AGPL-3.0",  # - GNU Affero General Public License v3
-    "GPL-2.0": "https://opensource.org/licenses/GPL-2.0",  # - GNU General Public License 2.0
-    "GPL-3.0": "https://opensource.org/licenses/GPL-3.0",  # - GNU General Public License 3.0
-    "LGPL-2.1": "https://opensource.org/licenses/LGPL-2.1",  # - GNU Lesser General Public License 2.1
-    "LGPL-3.0": "https://opensource.org/licenses/LGPL-3.0",  # - GNU Lesser General Public License 3.0
-    "HPND": "https://opensource.org/licenses/HPND",  # - Historical Permission Notice and Disclaimer
-    "IPL-1.0": "https://opensource.org/licenses/IPL-1.0",  # - IBM Public License 1.0
-    "IPA": "https://opensource.org/licenses/IPA",  # - IPA Font License
-    "ISC": "https://opensource.org/licenses/ISC",  # - ISC License
-    "Intel": "https://opensource.org/licenses/Intel",  # - Intel Open Source License
-    "LPPL-1.3c": "https://opensource.org/licenses/LPPL-1.3c",  # - LaTeX Project Public License 1.3c
-    "LPL-1.0": "https://opensource.org/licenses/LPL-1.0",  # - Lucent Public License (“Plan9”) 1.0
-    "LPL-1.02": "https://opensource.org/licenses/LPL-1.02",  # - Lucent Public License 1.02
-    "MIT": "https://opensource.org/licenses/MIT",  # - MIT License
-    "mitre": "https://opensource.org/licenses/CVW",  # - MITRE Collaborative Virtual Workspace License (CVW License)
-    "MS-PL": "https://opensource.org/licenses/MS-PL",  # - Microsoft Public License
-    "MS-RL": "https://opensource.org/licenses/MS-RL",  # - Microsoft Reciprocal License
-    "MirOS": "https://opensource.org/licenses/MirOS",  # - MirOS Licence
-    "Motosoto": "https://opensource.org/licenses/Motosoto",  # - Motosoto License
-    "MPL-1.0": "https://opensource.org/licenses/MPL-1.0",  # - Mozilla Public License 1.0
-    "MPL-1.1": "https://opensource.org/licenses/MPL-1.1",  # - Mozilla Public License 1.1
-    "MPL-2.0": "https://opensource.org/licenses/MPL-2.0",  # - Mozilla Public License 2.0
-    "Multics": "https://opensource.org/licenses/Multics",  # - Multics License
-    "NASA-1.3": "https://opensource.org/licenses/NASA-1.3",  # - NASA Open Source Agreement 1.3
-    "NTP": "https://opensource.org/licenses/NTP",  # - NTP License
-    "Naumen": "https://opensource.org/licenses/Naumen",  # - Naumen Public License
-    "NGPL": "https://opensource.org/licenses/NGPL",  # - Nethack General Public License
-    "Nokia": "https://opensource.org/licenses/Nokia",  # - Nokia Open Source License
-    "NPOSL-3.0": "https://opensource.org/licenses/NPOSL-3.0",  # - Non-Profit Open Software License 3.0
-    "OCLC-2.0": "https://opensource.org/licenses/OCLC-2.0",  # - OCLC Research Public License 2.0
-    "OFL-1.1": "https://opensource.org/licenses/OFL-1.1",  # - Open Font License 1.1
-    "OGL-UK-1.0": "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/1/",  # - Open Government Licence 1.0 (United Kingdom)
-    "OGL-UK-2.0": "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/2/",  # - Open Government Licence 2.0 (United Kingdom)
-    "OGL-UK-3.0": "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/",  # - Open Government Licence 3.0 (United Kingdom)
-    "OGTSL": "https://opensource.org/licenses/OGTSL",  # - Open Group Test Suite License
-    "OSL-3.0": "https://opensource.org/licenses/OSL-3.0",  # - Open Software License 3.0
-    "PHP-3.0": "https://opensource.org/licenses/PHP-3.0",  # - PHP License 3.0
-    "PostgreSQL": "https://opensource.org/licenses/PostgreSQL",  # - PostgreSQL License
-    "Python-2.0": "https://opensource.org/licenses/Python-2.0",  # - Python License 2.0
-    "QPL-1.0": "https://opensource.org/licenses/QPL-1.0",  # - Q Public License 1.0
-    "RPSL-1.0": "https://opensource.org/licenses/RPSL-1.0",  # - RealNetworks Public Source License 1.0
-    "RPL-1.5": "https://opensource.org/licenses/RPL-1.5",  # - Reciprocal Public License 1.5
-    "RSCPL": "https://opensource.org/licenses/RSCPL",  # - Ricoh Source Code Public License
-    "SimPL-2.0": "https://opensource.org/licenses/SimPL-2.0",  # - Simple Public License 2.0
-    "Sleepycat": "https://opensource.org/licenses/Sleepycat",  # - Sleepycat License
-    "SISSL": "https://opensource.org/licenses/SISSL",  # - Sun Industry Standards Source License 1.1
-    "SPL-1.0": "https://opensource.org/licenses/SPL-1.0",  # - Sun Public License 1.0
-    "Watcom-1.0": "https://opensource.org/licenses/Watcom-1.0",  # - Sybase Open Watcom Public License 1.0
-    "NCSA": "https://opensource.org/licenses/NCSA",  # - University of Illinois/NCSA Open Source License
-    "Unlicense": "https://unlicense.org/",  # - Unlicense
-    "VSL-1.0": "https://opensource.org/licenses/VSL-1.0",  # - Vovida Software License 1.0
-    "W3C": "https://opensource.org/licenses/W3C",  # - W3C License
-    "Xnet": "https://opensource.org/licenses/Xnet",  # - X.Net License
-    "ZPL-2.0": "https://opensource.org/licenses/ZPL-2.0",  # - Zope Public License 2.0
-    "WXwindows": "https://opensource.org/licenses/WXwindows",  # - wxWindows Library License
-    "Zlib": "https://opensource.org/licenses/Zlib",  # - zlib/libpng license
-    NoLicenceShort: NoLicence,  # - No license - no permission to use unless the owner grants a licence
-}
 
 
 class LicensedURI(NamedTuple):
@@ -415,6 +319,8 @@ class MaterializedContent(NamedTuple):
       needed for the provenance
     prettyFilename: The preferred filename to use in the inputs directory
       of the execution environment
+    fingerprint: If it is available, propagate the computed fingerprint
+      from the cache.
     """
 
     local: "AbsPath"
@@ -423,30 +329,14 @@ class MaterializedContent(NamedTuple):
     kind: "ContentKind" = ContentKind.File
     metadata_array: "Optional[Sequence[URIWithMetadata]]" = None
     extrapolated_local: "Optional[AbsPath]" = None
+    fingerprint: "Optional[Fingerprint]" = None
 
     @classmethod
     def _key_fixes(cls) -> "Mapping[str, str]":
         return {"uri": "licensed_uri"}
 
 
-class ProtocolFetcherReturn(NamedTuple):
-    kind_or_resolved: "Union[AnyURI, ContentKind, Sequence[AnyURI]]"
-    metadata_array: "Sequence[URIWithMetadata]"
-    licences: "Optional[Tuple[URIType, ...]]" = None
-
-
 if TYPE_CHECKING:
-    from mypy_extensions import DefaultNamedArg
-
-    ProtocolFetcher: TypeAlias = Callable[
-        [
-            URIType,
-            AbsPath,
-            DefaultNamedArg(Optional[SecurityContextConfig], "secContext"),
-        ],
-        ProtocolFetcherReturn,
-    ]
-
     MaterializedInputValues: TypeAlias = Union[
         Sequence[bool],
         Sequence[str],
@@ -615,154 +505,8 @@ class LocalWorkflow(NamedTuple):
     relPathFiles: "Optional[Sequence[Union[RelPath, URIType]]]" = None
 
 
-# This skeleton is here only for type mapping reasons
-class AbstractWorkflowEngineType(abc.ABC):
-    @classmethod
-    @abc.abstractmethod
-    def MyWorkflowType(cls) -> "WorkflowType":
-        pass
-
-    @property
-    def workflowType(self) -> "WorkflowType":
-        return self.MyWorkflowType()
-
-    @abc.abstractmethod
-    def getConfiguredContainerType(self) -> "ContainerType":
-        pass
-
-    @property
-    def configuredContainerType(self) -> "ContainerType":
-        return self.getConfiguredContainerType()
-
-    @property
-    @abc.abstractmethod
-    def engine_url(self) -> "URIType":
-        pass
-
-    @abc.abstractmethod
-    def _get_engine_version_str(
-        self, matWfEng: "MaterializedWorkflowEngine"
-    ) -> "WorkflowEngineVersionStr":
-        """
-        It must return a string in the form of
-        "{symbolic engine name} {version}"
-        """
-        pass
-
-    @abc.abstractmethod
-    def sideContainers(self) -> "Sequence[ContainerTaggedName]":
-        pass
-
-    @abc.abstractmethod
-    def materialize_containers(
-        self,
-        listOfContainerTags: "Sequence[ContainerTaggedName]",
-        containersDir: "AnyPath",
-        offline: "bool" = False,
-    ) -> "Tuple[ContainerEngineVersionStr, Sequence[Container], ContainerOperatingSystem, ProcessorArchitecture]":
-        pass
-
-    @abc.abstractmethod
-    def deploy_containers(
-        self,
-        containers_list: "Sequence[Container]",
-        containersDir: "Optional[AnyPath]" = None,
-        force: "bool" = False,
-    ) -> "Sequence[Container]":
-        pass
-
-    @property
-    @abc.abstractmethod
-    def staged_containers_dir(self) -> "AnyPath":
-        pass
-
-    @abc.abstractmethod
-    def materializeEngine(
-        self, localWf: "LocalWorkflow", engineVersion: "Optional[EngineVersion]" = None
-    ) -> "Optional[MaterializedWorkflowEngine]":
-        pass
-
-    @abc.abstractmethod
-    def identifyWorkflow(
-        self, localWf: "LocalWorkflow", engineVer: "Optional[EngineVersion]" = None
-    ) -> "Union[Tuple[EngineVersion, LocalWorkflow], Tuple[None, None]]":
-        """
-        This method should return the effective engine version needed
-        to run it when this workflow engine recognizes the workflow type
-        """
-        pass
-
-    @abc.abstractmethod
-    def materializeWorkflow(
-        self,
-        matWorfklowEngine: "MaterializedWorkflowEngine",
-        consolidatedWorkflowDir: "AbsPath",
-        offline: "bool" = False,
-    ) -> "Tuple[MaterializedWorkflowEngine, Sequence[ContainerTaggedName]]":
-        """
-        Method to ensure the workflow has been materialized. It returns a
-        possibly updated materialized workflow engine, as well as the list of containers
-
-        For Nextflow it is usually a no-op, but for CWL it requires resolution
-        """
-
-        pass
-
-    @abc.abstractmethod
-    def launchWorkflow(
-        self,
-        matWfEng: "MaterializedWorkflowEngine",
-        inputs: "Sequence[MaterializedInput]",
-        environment: "Sequence[MaterializedInput]",
-        outputs: "Sequence[ExpectedOutput]",
-    ) -> "StagedExecution":
-        pass
-
-    @classmethod
-    @abc.abstractmethod
-    def FromStagedSetup(
-        cls,
-        staged_setup: "StagedSetup",
-        cache_dir: "Optional[AnyPath]" = None,
-        cache_workflow_dir: "Optional[AnyPath]" = None,
-        cache_workflow_inputs_dir: "Optional[AnyPath]" = None,
-        local_config: "Optional[EngineLocalConfig]" = None,
-        config_directory: "Optional[AnyPath]" = None,
-    ) -> "AbstractWorkflowEngineType":
-        pass
-
-
 if TYPE_CHECKING:
     TRS_Workflow_Descriptor: TypeAlias = str
-
-
-class WorkflowType(NamedTuple):
-    """
-    engineName: symbolic name of the engine
-    shortname: short name used in the WfExS-backend configuration files
-    for the workflow language
-    name: Textual representation of the workflow language
-    clazz: Class implementing the engine invocation
-    uriMatch: The URI patterns used in RO-Crate to identify the workflow type
-    uriTemplate: The URI template to be used when RO-Crate ComputerLanguage is generated
-    url: The URL used in RO-Crate to represent the workflow language
-    trs_descriptor: The string used in GA4GH TRSv2 specification to define this workflow type
-    rocrate_programming_language: Traditional internal id in RO-Crate implementations used for this workflow type (to be deprecated)
-    """
-
-    engineName: "str"
-    shortname: "str"
-    name: "str"
-    clazz: "Type[AbstractWorkflowEngineType]"
-    uriMatch: "Sequence[Union[Pattern[str], URIType]]"
-    uriTemplate: "URIType"
-    url: "URIType"
-    trs_descriptor: "TRS_Workflow_Descriptor"
-    rocrate_programming_language: "str"
-
-    @classmethod
-    def _value_fixes(cls) -> "Mapping[str, Optional[str]]":
-        return {"shortname": "trs_descriptor"}
 
 
 class RepoType(enum.Enum):
@@ -802,17 +546,9 @@ class RemoteRepo(NamedTuple):
     guess_flavor: "Optional[RepoGuessFlavor]" = None
 
 
-class IdentifiedWorkflow(NamedTuple):
-    """
-    workflow_type: The identified workflow type
-    """
-
-    workflow_type: "WorkflowType"
-    remote_repo: "RemoteRepo"
-
-
 class StagedSetup(NamedTuple):
     instance_id: "WfExSInstanceId"
+    container_type: "ContainerType"
     nickname: "Optional[str]"
     creation: "datetime.datetime"
     workflow_config: "Optional[Mapping[str, Any]]"
@@ -864,52 +600,8 @@ class MarshallingStatus(NamedTuple):
 
 DEFAULT_CONTAINER_TYPE = ContainerType.Singularity
 
-
-@dataclass
-class Container(ContainerTaggedName):
-    """
-    origTaggedName: Symbolic name or identifier of the container
-        (including tag) which appears in the workflow.
-    type: Container type
-    registries:
-    taggedName: Symbolic name or identifier of the container (including tag)
-    localPath: The full local path to the container file (it can be None)
-    signature: Signature (aka file fingerprint) of the container
-        (sha256 or similar). It could be None outside Singularity solutions.
-    fingerprint: Server fingerprint of the container.
-        Mainly from docker registries.
-    metadataLocalPath: The full local path to the container metadata file (it can be None)
-    """
-
-    taggedName: "URIType" = cast("URIType", "")
-    architecture: "Optional[ProcessorArchitecture]" = None
-    operatingSystem: "Optional[ContainerOperatingSystem]" = None
-    localPath: "Optional[AbsPath]" = None
-    signature: "Optional[Fingerprint]" = None
-    fingerprint: "Optional[Fingerprint]" = None
-    metadataLocalPath: "Optional[AbsPath]" = None
-
-
-class MaterializedWorkflowEngine(NamedTuple):
-    """
-    instance: Instance of the workflow engine
-    version: Version of the engine to be used
-    fingerprint: Fingerprint of the engine to be used (it could be the version)
-    engine_path: Absolute path to the fetched engine
-    workflow: Instance of LocalWorkflow
-    containers_path: Where the containers are going to be available for offline-execute
-    containers: List of Container instances (needed by workflow)
-    operational_containers: List of Container instances (needed by engine)
-    """
-
-    instance: "AbstractWorkflowEngineType"
-    version: "EngineVersion"
-    fingerprint: "Union[Fingerprint, str]"
-    engine_path: "EnginePath"
-    workflow: "LocalWorkflow"
-    containers_path: "Optional[AbsPath]" = None
-    containers: "Optional[Sequence[Container]]" = None
-    operational_containers: "Optional[Sequence[Container]]" = None
+# Postfix of metadata files (generated by the instances)
+META_JSON_POSTFIX: "Final[str]" = "_meta.json"
 
 
 class AbstractWfExSException(Exception):
@@ -1003,38 +695,6 @@ class CratableItem(enum.IntFlag):
 NoCratableItem = CratableItem(0)
 
 
-class ExportItem(NamedTuple):
-    type: "ExportItemType"
-    block: "Optional[str]" = None
-    name: "Optional[Union[SymbolicParamName, SymbolicOutputName]]" = None
-
-
-# The description of an export action
-class ExportAction(NamedTuple):
-    action_id: "SymbolicName"
-    plugin_id: "SymbolicName"
-    what: "Sequence[ExportItem]"
-    context_name: "Optional[SymbolicName]"
-    setup: "Optional[SecurityContextConfig]"
-    preferred_scheme: "Optional[str]"
-    preferred_id: "Optional[str]"
-    licences: "Sequence[str]" = []
-
-
-class MaterializedExportAction(NamedTuple):
-    """
-    The description of an export action which was materialized, so
-    a permanent identifier was obtained, along with some metadata
-    """
-
-    action: "ExportAction"
-    elems: "Sequence[AnyContent]"
-    pids: "Sequence[URIWithMetadata]"
-    when: "datetime.datetime" = datetime.datetime.now(
-        tz=datetime.timezone.utc
-    ).astimezone()
-
-
 class StagedExecution(NamedTuple):
     """
     The description of the execution of a workflow, giving the relative directory of the output
@@ -1047,6 +707,9 @@ class StagedExecution(NamedTuple):
     started: "datetime.datetime"
     ended: "datetime.datetime"
     environment: "Sequence[MaterializedInput]" = []
+    outputMetaDir: "Optional[RelPath]" = None
+    diagram: "Optional[RelPath]" = None
+    logfile: "Sequence[RelPath]" = []
 
 
 # Next method has been borrowed from FlowMaps
