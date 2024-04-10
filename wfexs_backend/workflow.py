@@ -3810,7 +3810,7 @@ class WF:
                         cast("SymbolicParamName", item.name)
                     )
                     if materializedParam is None:
-                        raise KeyError(
+                        raise KeyError( 
                             f"Param {item.name} to be exported does not exist"
                         )
                     retval.extend(
