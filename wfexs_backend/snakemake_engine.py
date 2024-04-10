@@ -50,10 +50,7 @@ from .common import (
     LocalWorkflow,
     MaterializedContent,
     MaterializedInput,
-    MaterializedWorkflowEngine,
-    StagedExecution,
-    WorkflowType,
-
+    StagedExecution
 )
 
 
@@ -88,7 +85,6 @@ if TYPE_CHECKING:
         ExpectedOutput,
         Fingerprint,
         MaterializedOutput,
-        MaterializedWorkflowEngine, 
         RelPath,
         SymbolicParamName,
         URIType,
@@ -96,7 +92,13 @@ if TYPE_CHECKING:
     )
 
 
-from .engine import WorkflowEngine, WorkflowEngineException
+from .engine import (
+    WorkflowEngine, 
+    WorkflowEngineException, 
+    MaterializedWorkflowEngine,
+    WorkflowType
+)
+
 from .engine import (
     WORKDIR_STATS_RELDIR,
     WORKDIR_STDOUT_FILE,
@@ -105,9 +107,7 @@ from .engine import (
 )   
 
 import snakemake.workflow as smk_wf
-from .utils.smk import(
-    get_min_version
-    )  
+from .utils.smk import *
 
 class SnakemakeWorkflowEngine(WorkflowEngine):
     SNAKEMAKE_REPO = ""
@@ -140,6 +140,7 @@ class SnakemakeWorkflowEngine(WorkflowEngine):
 
     def __init__(
         self,
+        container_type: "ContainerType" = ContainerType.NoContainer,
         cacheDir: "Optional[AnyPath]" = None,
         workflow_config: "Optional[Mapping[str, Any]]" = None,
         local_config: "Optional[EngineLocalConfig]" = None,
@@ -157,6 +158,7 @@ class SnakemakeWorkflowEngine(WorkflowEngine):
         config_directory: "Optional[AnyPath]" = None,
     ):
         super().__init__(
+            container_type=container_type,
             cacheDir=cacheDir,
             workflow_config=workflow_config,
             local_config=local_config,
@@ -307,14 +309,55 @@ class SnakemakeWorkflowEngine(WorkflowEngine):
             (engineVer is None) or engineVer < minimalEngineVer
         ):
             engineVer = minimalEngineVer
+            self.logger.debug(f"Found min_version {engineVer}.")
 
         if engineVer is None:
             engineVer = self.smk_version
+            self.logger.debug(f"Default min_version selected {engineVer}.")
+
                          
-        # Subworkflow / module include detection
+        # Include files detection
+        includes: "Sequence[smkInclude]"
+        smkScripts: "MutableSequence[AbsPath]" = []
+        
+        self.logger.debug(f"candidateSmk: {candidateSmk}.")
+        includes = extract_smk_includes(candidate=candidateSmk) # Get list of abs.paths included smk files
+        if len(includes)>0:
+            for callPath in includes:
+                incl_smkFile = smk_wf.infer_source_file(callPath)
+                incl_wf = smk_wf.Workflow(callPath)
+                try: 
+                    smk_compilation, linemap, rulecount = smk_wf.parse(incl_smkFile, incl_wf)
+                except Exception as e:
+                        errstr = f"Failed to parse snakemake file {os.path(callPath)} with smk parser"
+                        self.logger.exception(errstr)
+                        raise WorkflowEngineException(errstr) from e
+                if smk_compilation is not None and rulecount==0: #not workflow, could be only functions
+                    self.logger.warning(
+                                f"Snakemake file {os.path(callPath)} included does not contain workflow rules."
+                            )
+                elif smk_compilation is not None and rulecount>0:
+                    # Register all the included files which are reachable
+                    if not callPath.path.endswith(".smk"):
+                        callPath.path += ".smk"
+                        if os.path.isfile(callPath.path):
+                            smkScripts.append(callPath.path)
+                        else:
+                            self.logger.warning(
+                                f"Snakemake file {callPath.path} included not found."
+                            )
+                elif smk_compilation is None: #no worklow or invalid Snakefile
+                    raise WorkflowEngineException(
+                    f"Detected empty included snakemake file {callPath.path} with smk parser."
+                    )
+        else: 
+            self.logger.debug(f"Not included files detected in {candidateSmk}.")
+
+            
+        # Subworkflows / modules detection
 
         # Wrappers include detection
-
+        
         candidateSmk = cast("RelPath", os.path.relpath(candidateSmk, smkDir))
 
         return engineVer, LocalWorkflow(
@@ -322,7 +365,8 @@ class SnakemakeWorkflowEngine(WorkflowEngine):
             relPath= candidateSmk,
             effectiveCheckout=localWf.effectiveCheckout,
             langVersion=engineVer,
-            relPathFiles=[cast("RelPath", localWf.relPath)],
+            relPathFiles=smkScripts, #return named tupple --> HintedWorkflowComponent
+            # need to be rel path? (from root working dir) or could it be abs? 
         )
         
         
@@ -505,9 +549,15 @@ class SnakemakeWorkflowEngine(WorkflowEngine):
     ) -> "Tuple[MaterializedWorkflowEngine, Sequence[ContainerTaggedName]]":
         """
         Method to ensure the workflow has been materialized. It returns the
-        localWorkflow directory, as well as the list of containers
+        localWorkflow directory, as well as the list of containers.
         """
-        ### TBC ....
+
+        localWf = matWorkflowEngine.workflow
+        
+
+
+        
+        return ...
 
     
     def simpleContainerFileName(self, imageUrl: "URIType") -> "RelPath":
