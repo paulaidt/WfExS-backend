@@ -1,11 +1,11 @@
-workflow_id: github:inab/hello-workflows/5d12ff0f61265195ce6a923a55e387574a0fcbea/snakemake
+workflow_id: github:inab/hello-workflows/10d9e186e0e997bdc8c0a5139a88ab1f5075131f/snakemake
 workflow_config:
   secure: false
 # All the inputs must be URLs or CURIEs from identifiers.org
 params:
   an_input:
     c-l-a-s-s: File
-    url: github:inab/hello-workflows/5d12ff0f61265195ce6a923a55e387574a0fcbea/snakemake/Snakefile
+    url: github:inab/hello-workflows/10d9e186e0e997bdc8c0a5139a88ab1f5075131f/snakemake/Snakefile
   output_dir:
     c-l-a-s-s: Directory
     # This hint tells that this parameter is the output directory
