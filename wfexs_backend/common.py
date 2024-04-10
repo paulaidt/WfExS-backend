@@ -517,7 +517,11 @@ class LocalWorkflow(NamedTuple):
     relPath: "Optional[RelPath]"
     effectiveCheckout: "Optional[RepoTag]"
     langVersion: "Optional[Union[EngineVersion, WFLangVersion]]" = None
+<<<<<<< HEAD
     relPathFiles: "Optional[Union[Sequence[Union[RelPath, URIType]], Sequence[HintedWorkflowComponent]]]" = None
+=======
+    relPathFiles: "Optional[Sequence[Union[RelPath, URIType]]]" = None
+>>>>>>> 957ace5c1fdb3a414ab83cf2717062fd6895275f
 
 
 if TYPE_CHECKING:
