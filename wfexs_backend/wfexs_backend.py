@@ -35,9 +35,11 @@ import tempfile
 import types
 import urllib.parse
 import uuid
+import warnings
 
 from typing import (
     cast,
+    NamedTuple,
     Pattern,
     TYPE_CHECKING,
 )
@@ -59,7 +61,6 @@ from .common import (
     ContentKind,
     DEFAULT_FUSERMOUNT_CMD,
     DEFAULT_PROGS,
-    IdentifiedWorkflow,
     LicensedURI,
     MaterializedContent,
     RemoteRepo,
@@ -88,6 +89,8 @@ from .engine import (
 )
 from .ro_crate import FixedROCrate
 
+from .security_context import SecurityContextVault
+
 from .utils.marshalling_handling import unmarshall_namedtuple
 from .utils.misc import config_validate
 from .utils.misc import (
@@ -99,6 +102,9 @@ from .utils.passphrase_wrapper import (
     WfExSPassGenSingleton,
 )
 
+from .fetchers import (
+    DocumentedProtocolFetcher,
+)
 from .fetchers.http import SCHEME_HANDLERS as HTTP_SCHEME_HANDLERS
 from .fetchers.ftp import SCHEME_HANDLERS as FTP_SCHEME_HANDLERS
 from .fetchers.sftp import SCHEME_HANDLERS as SFTP_SCHEME_HANDLERS
@@ -162,7 +168,6 @@ if TYPE_CHECKING:
     from crypt4gh.header import CompoundKey
 
     from .common import (
-        AbstractWorkflowEngineType,
         AbsPath,
         AnyPath,
         EnvironmentBlock,
@@ -172,7 +177,6 @@ if TYPE_CHECKING:
         OutputsBlock,
         ParamsBlock,
         ProgsMapping,
-        ProtocolFetcher,
         RelPath,
         RepoTag,
         RepoURL,
@@ -186,8 +190,12 @@ if TYPE_CHECKING:
         WfExSInstanceId,
         WorkflowConfigBlock,
         WorkflowMetaConfigBlock,
-        WorkflowType,
         WritableWfExSConfigBlock,
+    )
+
+    from .engine import (
+        AbstractWorkflowEngineType,
+        WorkflowType,
     )
 
     from .fetchers import (
@@ -205,6 +213,15 @@ if TYPE_CHECKING:
         WFVersionId,
         WorkflowId,
     )
+
+
+class IdentifiedWorkflow(NamedTuple):
+    """
+    workflow_type: The identified workflow type
+    """
+
+    workflow_type: "WorkflowType"
+    remote_repo: "RemoteRepo"
 
 
 class WfExSBackendException(AbstractWfExSException):
@@ -367,7 +384,7 @@ class WfExSBackend:
         cls,
         workflow_meta: "WorkflowMetaConfigBlock",
         local_config: "WfExSConfigBlock",
-        creds_config: "Optional[SecurityContextConfigBlock]" = None,
+        vault: "Optional[SecurityContextVault]" = None,
         config_directory: "Optional[AnyPath]" = None,
         public_key_filenames: "Sequence[AnyPath]" = [],
         private_key_filename: "Optional[AnyPath]" = None,
@@ -378,16 +395,17 @@ class WfExSBackend:
         :param workflow_meta: The configuration describing both the workflow
         and the inputs to use when it is being instantiated.
         :param local_config: Relevant local configuration, like the cache directory.
-        :param creds_config: Dictionary with the different credential contexts (to be implemented)
         :param config_directory:
         :type workflow_meta: dict
         :type local_config: dict
-        :type creds_config: dict
         :type config_directory:
         :return: Workflow configuration
         """
-        if creds_config is None:
-            creds_config = {}
+        warnings.warn(
+            "fromDescription is being deprecated",
+            PendingDeprecationWarning,
+            stacklevel=2,
+        )
 
         _, updated_local_config = cls.bootstrap(
             local_config, config_directory=config_directory
@@ -403,7 +421,7 @@ class WfExSBackend:
             outputs=workflow_meta.get("outputs", {}),
             default_actions=workflow_meta.get("default_actions", []),
             workflow_config=workflow_meta.get("workflow_config"),
-            creds_config=creds_config,
+            vault=vault,
             public_key_filenames=public_key_filenames,
             private_key_filename=private_key_filename,
             private_key_passphrase=private_key_passphrase,
@@ -664,6 +682,7 @@ class WfExSBackend:
         sec_context: "Optional[SecurityContextConfig]",
         licences: "Sequence[str]",
         orcids: "Sequence[str]",
+        preferred_id: "Optional[str]",
     ) -> "AbstractExportPlugin":
         """
         This method instantiates an stateful export plugin
@@ -683,7 +702,11 @@ class WfExSBackend:
             raise ValueError(f"Staged setup from {stagedSetup.instance_id} is damaged")
 
         return self._export_plugins[plugin_id](
-            wfInstance, setup_block=sec_context, licences=licences, orcids=orcids
+            wfInstance,
+            setup_block=sec_context,
+            licences=licences,
+            orcids=orcids,
+            preferred_id=preferred_id,
         )
 
     def addStatefulSchemeHandlers(
@@ -712,7 +735,7 @@ class WfExSBackend:
 
     def addSchemeHandlers(
         self,
-        schemeHandlers: "Mapping[str, Union[ProtocolFetcher, Type[AbstractStatefulFetcher]]]",
+        schemeHandlers: "Mapping[str, Union[DocumentedProtocolFetcher, Type[AbstractStatefulFetcher]]]",
         fetchers_setup_block: "Optional[Mapping[str, Mapping[str, Any]]]" = None,
     ) -> None:
         """
@@ -741,8 +764,13 @@ class WfExSBackend:
                         schemeHandler, setup_block=setup_block
                     )
                     if instSchemeInstance is not None:
-                        instSchemeHandler = instSchemeInstance.fetch
-                elif callable(schemeHandler):
+                        instSchemeHandler = DocumentedProtocolFetcher(
+                            fetcher=instSchemeInstance.fetch,
+                            description=instSchemeInstance.description,
+                        )
+                elif isinstance(schemeHandler, DocumentedProtocolFetcher) and callable(
+                    schemeHandler.fetcher
+                ):
                     instSchemeHandler = schemeHandler
 
                 # Only the ones which have overcome the sanity checks
@@ -753,8 +781,8 @@ class WfExSBackend:
 
             self.cacheHandler.addRawSchemeHandlers(instSchemeHandlers)
 
-    def listFetchableSchemes(self) -> "Sequence[str]":
-        return self.cacheHandler.getRegisteredSchemes()
+    def describeFetchableSchemes(self) -> "Sequence[Tuple[str, str]]":
+        return self.cacheHandler.describeRegisteredSchemes()
 
     def newSetup(
         self,
@@ -767,7 +795,7 @@ class WfExSBackend:
         outputs: "Optional[OutputsBlock]" = None,
         default_actions: "Optional[Sequence[ExportActionBlock]]" = None,
         workflow_config: "Optional[WorkflowConfigBlock]" = None,
-        creds_config: "Optional[SecurityContextConfigBlock]" = None,
+        vault: "Optional[SecurityContextVault]" = None,
         public_key_filenames: "Sequence[AnyPath]" = [],
         private_key_filename: "Optional[AnyPath]" = None,
         private_key_passphrase: "Optional[str]" = None,
@@ -786,7 +814,7 @@ class WfExSBackend:
             outputs=outputs,
             default_actions=default_actions,
             workflow_config=workflow_config,
-            creds_config=creds_config,
+            vault=vault,
             public_key_filenames=public_key_filenames,
             private_key_filename=private_key_filename,
             private_key_passphrase=private_key_passphrase,
@@ -975,15 +1003,39 @@ class WfExSBackend:
             paranoidMode=paranoidMode,
         )
 
+    def fromPreviousInstanceDeclaration(
+        self,
+        wfInstance: "WF",
+        securityContextsConfigFilename: "Optional[AnyPath]" = None,
+        nickname_prefix: "Optional[str]" = None,
+        orcids: "Sequence[str]" = [],
+        public_key_filenames: "Sequence[AnyPath]" = [],
+        private_key_filename: "Optional[AnyPath]" = None,
+        private_key_passphrase: "Optional[str]" = None,
+        paranoidMode: "bool" = False,
+    ) -> "WF":
+        return WF.FromPreviousInstanceDeclaration(
+            self,
+            wfInstance,
+            securityContextsConfigFilename=securityContextsConfigFilename,
+            nickname_prefix=nickname_prefix,
+            orcids=orcids,
+            public_key_filenames=public_key_filenames,
+            private_key_filename=private_key_filename,
+            private_key_passphrase=private_key_passphrase,
+            paranoidMode=paranoidMode,
+        )
+
     def parseAndValidateSecurityContextFile(
         self, securityContextsConfigFilename: "AnyPath"
     ) -> "Tuple[ExitVal, SecurityContextConfigBlock]":
         numErrors = 0
         self.logger.info(f"Validating {securityContextsConfigFilename}")
 
-        creds_config = WF.ReadSecurityContextFile(securityContextsConfigFilename)
+        creds_config, valErrors = SecurityContextVault.ReadSecurityContextFile(
+            securityContextsConfigFilename
+        )
 
-        valErrors = config_validate(creds_config, WF.SECURITY_CONTEXT_SCHEMA)
         if len(valErrors) == 0:
             self.logger.info("No validation errors in security block")
         else:
@@ -1031,7 +1083,7 @@ class WfExSBackend:
     def fromDescription(
         self,
         workflow_meta: "WorkflowMetaConfigBlock",
-        creds_config: "Optional[SecurityContextConfigBlock]" = None,
+        vault: "Optional[SecurityContextVault]" = None,
         orcids: "Sequence[str]" = [],
         public_key_filenames: "Sequence[AnyPath]" = [],
         private_key_filename: "Optional[AnyPath]" = None,
@@ -1049,11 +1101,16 @@ class WfExSBackend:
         :type paranoidMode:
         :return: Workflow configuration
         """
+        warnings.warn(
+            "fromDescription is being deprecated",
+            PendingDeprecationWarning,
+            stacklevel=2,
+        )
 
         return WF.FromDescription(
             self,
             workflow_meta,
-            creds_config,
+            SecurityContextVault() if vault is None else vault,
             orcids=orcids,
             public_key_filenames=public_key_filenames,
             private_key_filename=private_key_filename,
@@ -1443,7 +1500,8 @@ class WfExSBackend:
         offline: "bool",
         ignoreCache: "bool" = False,
         registerInCache: "bool" = True,
-        secContext: "Optional[SecurityContextConfig]" = None,
+        vault: "Optional[SecurityContextVault]" = None,
+        sec_context_name: "Optional[str]" = None,
     ) -> "CachedContent":
         """
         This is a pass-through method to the cache handler, which translates from symbolic types of cache to their corresponding directories
@@ -1455,7 +1513,7 @@ class WfExSBackend:
         :param ignoreCache: Even if the content is cache, discard and re-fetch it
         :param registerInCache: Should the fetched content be registered
         in the cache?
-        :param secContext: The security context which has to be passed to
+        :param vault: The security context which has to be passed to
         the fetchers, in case they have to be used
         """
         if cacheType != CacheType.Workflow:
@@ -1465,7 +1523,8 @@ class WfExSBackend:
                 offline=offline,
                 ignoreCache=ignoreCache,
                 registerInCache=registerInCache,
-                secContext=secContext,
+                vault=vault,
+                sec_context_name=sec_context_name,
             )
         else:
             workflow_dir, repo, _, effective_checkout = self.cacheWorkflow(
@@ -1495,7 +1554,9 @@ class WfExSBackend:
             config_directory=self.config_directory,
         )
 
-    def addSchemeHandler(self, scheme: "str", handler: "ProtocolFetcher") -> None:
+    def addSchemeHandler(
+        self, scheme: "str", handler: "DocumentedProtocolFetcher"
+    ) -> None:
         """
 
         :param scheme:
@@ -1748,15 +1809,9 @@ class WfExSBackend:
                     )
                 )
 
-        (
-            metaContentKind,
-            cachedTRSMetaFile,
-            trsMetaMeta,
-            trsMetaLicences,
-        ) = trs_cached_content
         # Giving a friendly name
         if not os.path.exists(trsMetadataCache):
-            os.symlink(os.path.basename(cachedTRSMetaFile), trsMetadataCache)
+            os.symlink(os.path.basename(trs_cached_content.path), trsMetadataCache)
 
         with open(trsMetadataCache, mode="r", encoding="utf-8") as ctmf:
             trs_endpoint_meta = json.load(ctmf)
@@ -2318,12 +2373,13 @@ class WfExSBackend:
 
     def downloadContent(
         self,
-        remote_file: "Union[URIType, LicensedURI, Sequence[URIType], Sequence[LicensedURI]]",
+        remote_file: "Union[LicensedURI, Sequence[LicensedURI]]",
         dest: "Union[AbsPath, CacheType]",
-        secContext: "Optional[SecurityContextConfig]" = None,
+        vault: "Optional[SecurityContextVault]" = None,
         offline: "bool" = False,
         ignoreCache: "bool" = False,
         registerInCache: "bool" = True,
+        keep_cache_licence: "bool" = True,
     ) -> "MaterializedContent":
         """
         Download remote file or directory / dataset.
@@ -2336,12 +2392,12 @@ class WfExSBackend:
         """
 
         # Preparation of needed structures
-        remote_uris_e: "Union[Sequence[URIType], Sequence[LicensedURI]]"
+        remote_uris_e: "Sequence[LicensedURI]"
         if isinstance(remote_file, list):
             remote_uris_e = remote_file
         else:
             remote_uris_e = cast(
-                "Union[MutableSequence[URIType], MutableSequence[LicensedURI]]",
+                "MutableSequence[LicensedURI]",
                 [remote_file],
             )
 
@@ -2349,15 +2405,12 @@ class WfExSBackend:
             len(remote_uris_e) > 0
         ), "The list of remote URIs to download should have at least one element"
 
-        firstURI: "Optional[Union[URIType, LicensedURI]]" = None
+        firstURI: "Optional[LicensedURI]" = None
         firstParsedURI: "Optional[parse.ParseResult]" = None
         remote_uris: "MutableSequence[URIType]" = []
         # Brief validation of correct uris
         for remote_uri_e in remote_uris_e:
-            if isinstance(remote_uri_e, LicensedURI):
-                remote_uri = remote_uri_e.uri
-            else:
-                remote_uri = remote_uri_e
+            remote_uri = remote_uri_e.uri
 
             parsedURI = parse.urlparse(remote_uri)
             validableComponents = [parsedURI.scheme, parsedURI.path]
@@ -2388,11 +2441,10 @@ class WfExSBackend:
             offline=offline,
             ignoreCache=ignoreCache,
             registerInCache=registerInCache,
-            secContext=secContext,
+            vault=vault,
         )
-        downloaded_uri = (
-            remote_file.uri if isinstance(remote_file, LicensedURI) else remote_file
-        )
+        # TODO: Properly test alternatives
+        downloaded_uri = firstURI.uri
         self.logger.info(
             "downloaded workflow input: {} => {}".format(
                 downloaded_uri, cached_content.path
@@ -2408,37 +2460,32 @@ class WfExSBackend:
                 )
             )
 
-            if isinstance(firstURI, LicensedURI):
-                firstLicensedURI = LicensedURI(
-                    uri=cached_content.metadata_array[0].uri,
-                    licences=cached_content.licences,
-                    attributions=firstURI.attributions,
-                )
-            else:
-                firstURI = cached_content.metadata_array[0].uri
+            firstLicensedURI = LicensedURI(
+                uri=cached_content.metadata_array[0].uri,
+                licences=cached_content.licences
+                if keep_cache_licence
+                else firstURI.licences,
+                attributions=firstURI.attributions,
+            )
             # The preferred name is obtained from the metadata
             for m in cached_content.metadata_array:
                 if m.preferredName is not None:
                     prettyFilename = m.preferredName
                     break
+        else:
+            # This alternative could happen,
+            # but it should not.
+            # Anyway, junking the security context
+            firstLicensedURI = firstURI._replace(
+                licences=cached_content.licences
+                if keep_cache_licence
+                else firstURI.licences,
+                secContext=None,
+            )
 
         if prettyFilename is None:
             # Default pretty filename in the worst case
             prettyFilename = cast("RelPath", firstParsedURI.path.split("/")[-1])
-
-        if isinstance(firstURI, LicensedURI):
-            # Junking the security context
-            if firstURI.secContext is None:
-                firstLicensedURI = firstURI
-            else:
-                firstLicensedURI = LicensedURI(
-                    uri=firstURI.uri,
-                    licences=firstURI.licences,
-                    attributions=firstURI.attributions,
-                )
-        else:
-            # No licensing information attached
-            firstLicensedURI = LicensedURI(uri=firstURI)
 
         return MaterializedContent(
             local=cached_content.path,
@@ -2446,4 +2493,5 @@ class WfExSBackend:
             prettyFilename=prettyFilename,
             kind=cached_content.kind,
             metadata_array=cached_content.metadata_array,
+            fingerprint=cached_content.fingerprint,
         )

@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from typing import (
         Callable,
         Sequence,
+        Tuple,
         Type,
         Union,
     )
@@ -77,9 +78,10 @@ try:
 except ImportError:
     from yaml import Loader as YAMLLoader, Dumper as YAMLDumper
 
+from .security_context import SecurityContextVault
 from .wfexs_backend import WfExSBackend
 from .workflow import WF
-from . import get_WfExS_version
+from . import get_WfExS_version_str
 from .utils.misc import DatetimeEncoder
 
 
@@ -101,6 +103,10 @@ class WfExS_Commands(StrDocEnum):
     Stage = (
         "stage",
         "Prepare the staging (working) directory for workflow execution, fetching dependencies and contents",
+    )
+    ReStage = (
+        "re-stage",
+        "Prepare a new staging (working) directory for workflow execution, repeating the fetch of dependencies and contents",
     )
     MountWorkDir = (
         "mount-workdir",
@@ -222,7 +228,7 @@ def genParserSub(
             help="Configuration file, describing workflow and inputs",
         )
 
-    if preStageParams or exportParams:
+    if preStageParams or exportParams or command == WfExS_Commands.ReStage:
         ap_.add_argument(
             "-Z",
             "--creds-config",
@@ -238,7 +244,9 @@ def genParserSub(
             help="Configuration file, describing exports which can be done",
         )
 
-    if preStageParams and command not in (WfExS_Commands.ConfigValidate,):
+    if (
+        preStageParams and command not in (WfExS_Commands.ConfigValidate,)
+    ) or command == WfExS_Commands.ReStage:
         ap_.add_argument(
             "-n",
             "--nickname-prefix",
@@ -250,7 +258,7 @@ def genParserSub(
         (preStageParams and command not in (WfExS_Commands.ConfigValidate,))
         or crateParams
         or exportParams
-        or command == WfExS_Commands.ExportResults
+        or command in (WfExS_Commands.ReStage, WfExS_Commands.ExportResults)
     ):
         ap_.add_argument(
             "--orcid",
@@ -260,7 +268,11 @@ def genParserSub(
             help="ORCID(s) of the person(s) staging, running or exporting the workflow scenario",
         )
 
-    if command in (WfExS_Commands.Stage, WfExS_Commands.Execute) or exportParams:
+    if (
+        command
+        in (WfExS_Commands.Stage, WfExS_Commands.ReStage, WfExS_Commands.Execute)
+        or exportParams
+    ):
         ap_.add_argument(
             "--public-key-file",
             dest="public_key_files",
@@ -327,6 +339,12 @@ def genParserSub(
             help="Licence(s) to attach to the generated RO-Crate",
         )
 
+        mat_opts.add_argument(
+            "--crate-pid",
+            dest="crate_pid",
+            help="Permanent identifier to embed within the generated RO-Crate metadata, like a pre-generated DOI",
+        )
+
     if (exportParams or command == WfExS_Commands.ExportResults) and not crateParams:
         ap_.add_argument(
             "--licence",
@@ -340,10 +358,10 @@ def genParserSub(
 
 
 def processListFetchersCommand(wfBackend: "WfExSBackend", logLevel: "int") -> "int":
-    fetchable_schemes = wfBackend.listFetchableSchemes()
+    fetchable_schemes = wfBackend.describeFetchableSchemes()
     print(f"{len(fetchable_schemes)} supported fetchers")
-    for fetchable_scheme in fetchable_schemes:
-        print(f"\t{fetchable_scheme}")
+    for fetchable_scheme, description in fetchable_schemes:
+        print(f"\t{fetchable_scheme} => {description}")
 
     return 0
 
@@ -483,22 +501,17 @@ def processCacheCommand(
     elif args.cache_command == WfExS_Cache_Commands.Fetch:
         if len(args.cache_command_args) == 1 or len(args.cache_command_args) == 3:
             uri_to_fetch = args.cache_command_args[0]
-            secContext = None
+            vault = SecurityContextVault()
             if len(args.cache_command_args) == 3:
                 secContextFilename = args.cache_command_args[1]
                 secContextName = args.cache_command_args[2]
 
                 if os.path.exists(secContextFilename):
-                    (
-                        numErrors,
-                        secContextBlock,
-                    ) = wfBackend.parseAndValidateSecurityContextFile(
-                        secContextFilename
-                    )
-                    if numErrors > 0:
-                        print(
-                            f"ERROR: security context file {secContextFilename} has {numErrors} errors",
-                            file=sys.stderr,
+                    try:
+                        vault = SecurityContextVault(secContextFilename)
+                    except:
+                        logging.exception(
+                            f"ERROR: security context file {secContextFilename} is corrupted"
                         )
                         retval = 1
                 else:
@@ -509,7 +522,8 @@ def processCacheCommand(
                     retval = 1
 
                 if retval == 0:
-                    secContext = secContextBlock.get(secContextName)
+                    # TODO: Revise and Fix this
+                    secContext = vault.getContext(uri_to_fetch, secContextName)
                     if secContext is None:
                         print(
                             f"ERROR: security context file {secContextFilename} does not contain the security context {secContextName}",
@@ -519,7 +533,11 @@ def processCacheCommand(
 
             if retval == 0:
                 cached_content = wfBackend.cacheFetch(
-                    uri_to_fetch, args.cache_type, offline=False, secContext=secContext
+                    uri_to_fetch,
+                    args.cache_type,
+                    offline=False,
+                    vault=vault,
+                    sec_context_name=secContextName,
                 )
                 print(
                     f"{cached_content.kind}\t{cached_content.path}\t{cached_content.licences}\t{cached_content.metadata_array}"
@@ -566,6 +584,15 @@ def processStagedWorkdirCommand(
         op_orcids = args.orcids
     else:
         op_orcids = []
+
+    if (
+        hasattr(args, "crate_pid")
+        and args.crate_pid is not None
+        and len(args.crate_pid) > 0
+    ):
+        op_crate_pid = args.crate_pid
+    else:
+        op_crate_pid = None
 
     if args.staged_workdir_command == WfExS_Staged_WorkDir_Commands.Mount:
         if len(args.staged_workdir_command_args) > 0:
@@ -783,6 +810,7 @@ def processStagedWorkdirCommand(
                                 payloads=doMaterializedROCrate,
                                 licences=op_licences,
                                 orcids=op_orcids,
+                                crate_pid=op_crate_pid,
                             )
                         else:
                             mStatus = wfInstance.getMarshallingStatus(reread_stats=True)
@@ -798,6 +826,7 @@ def processStagedWorkdirCommand(
                                     payloads=doMaterializedROCrate,
                                     licences=op_licences,
                                     orcids=op_orcids,
+                                    crate_pid=op_crate_pid,
                                 )
                             else:
                                 print(
@@ -853,13 +882,12 @@ def processExportCommand(
 
     return retval
 
+def get_wfexs_argparse() -> "argparse.ArgumentParser":
+    retval, _ = _get_wfexs_argparse_internal(docgen=True)
+    return retval
 
-def main() -> None:
-    wfexs_version = get_WfExS_version()
-    if wfexs_version[1] is None:
-        verstr = wfexs_version[0]
-    else:
-        verstr = "{0[0]} ({0[1]})".format(wfexs_version)
+def _get_wfexs_argparse_internal(docgen: "bool") -> "Tuple[argparse.ArgumentParser, str]":
+    verstr = get_WfExS_version_str()
 
     defaultLocalConfigFilename = os.environ.get("WFEXS_CONFIG_FILE")
     if defaultLocalConfigFilename is None:
@@ -870,6 +898,9 @@ def main() -> None:
         defaultLocalConfigFilename = os.path.join(
             os.getcwd(), defaultLocalConfigFilename
         )
+
+    rawpre = "" if docgen else "raw|"
+
     ap = argparse.ArgumentParser(
         description="WfExS (workflow execution service) backend " + verstr,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -934,7 +965,7 @@ def main() -> None:
     ap_c = genParserSub(sp, WfExS_Commands.Cache)
     ap_c.add_argument(
         "cache_command",
-        help="raw|Cache command to perform\n\n"
+        help=f"{rawpre}Cache command to perform\n\n"
         + "\n".join(
             map(lambda c: f"{c.value:<12}{c.description}", WfExS_Cache_Commands)  # type: ignore[attr-defined]
         ),
@@ -965,7 +996,7 @@ def main() -> None:
     )
     ap_c.add_argument(
         "cache_type",
-        help="raw|Cache type to perform the cache command\n\n"
+        help=f"{rawpre}Cache type to perform the cache command\n\n"
         + "\n".join(map(lambda c: f"{c.value:<12}{c.description}", WfExS_CacheType)),  # type: ignore[attr-defined]
         type=cast("Callable_WfExS_CacheType", WfExS_CacheType.argtype),
         choices=WfExS_CacheType,
@@ -977,7 +1008,7 @@ def main() -> None:
     ap_w = genParserSub(sp, WfExS_Commands.StagedWorkDir, crateParams=True)
     ap_w.add_argument(
         "staged_workdir_command",
-        help="raw|Staged working directory command to perform\n\n"
+        help=f"{rawpre}Staged working directory command to perform\n\n"
         + "\n".join(
             map(
                 lambda c: f"{c.value:<16}{c.description}", WfExS_Staged_WorkDir_Commands  # type: ignore[attr-defined]
@@ -1008,7 +1039,7 @@ def main() -> None:
     )
     ap_expt.add_argument(
         "export_contents_command",
-        help="raw|Export operations from staged working directory to perform\n\n"
+        help=f"{rawpre}Export operations from staged working directory to perform\n\n"
         + "\n".join(
             map(lambda c: f"{c.value:<16}{c.description}", WfExS_Export_Commands)  # type: ignore[attr-defined]
         ),
@@ -1024,6 +1055,8 @@ def main() -> None:
     ap_cv = genParserSub(sp, WfExS_Commands.ConfigValidate, preStageParams=True)
 
     ap_s = genParserSub(sp, WfExS_Commands.Stage, preStageParams=True)
+
+    ap_r_s = genParserSub(sp, WfExS_Commands.ReStage, postStageParams=True)
 
     ap_m = genParserSub(sp, WfExS_Commands.MountWorkDir, postStageParams=True)
 
@@ -1046,6 +1079,11 @@ def main() -> None:
     ap_ec = genParserSub(
         sp, WfExS_Commands.ExportCrate, postStageParams=True, crateParams=True
     )
+
+    return ap, defaultLocalConfigFilename
+
+def main() -> None:
+    ap, defaultLocalConfigFilename = _get_wfexs_argparse_internal(docgen=False)
 
     args = ap.parse_args()
 
@@ -1143,6 +1181,7 @@ def main() -> None:
         WfExS_Commands.ListFetchers,
         WfExS_Commands.ListPushers,
         WfExS_Commands.Stage,
+        WfExS_Commands.ReStage,
         WfExS_Commands.Execute,
     ):
         updated_config, local_config = WfExSBackend.bootstrap(
@@ -1196,9 +1235,19 @@ def main() -> None:
     else:
         op_orcids = []
 
+    if (
+        hasattr(args, "crate_pid")
+        and args.crate_pid is not None
+        and len(args.crate_pid) > 0
+    ):
+        op_crate_pid = args.crate_pid
+    else:
+        op_crate_pid = None
+
     wfInstance = None
     if command in (
         WfExS_Commands.MountWorkDir,
+        WfExS_Commands.ReStage,
         WfExS_Commands.Export,
         WfExS_Commands.ExportStage,
         WfExS_Commands.OfflineExecute,
@@ -1263,6 +1312,30 @@ def main() -> None:
     if command != WfExS_Commands.MountWorkDir:
         atexit.register(wfInstance.cleanup)
 
+    # The special case of re-staging
+    if command == WfExS_Commands.ReStage:
+        source_wfInstance = wfInstance
+        source_wfSetup = source_wfInstance.getStagedSetup()
+        print(
+            f"\t- Source working directory is {source_wfSetup.work_dir}",
+            file=sys.stderr,
+        )
+        print(
+            "\t  Source instance {} (nickname '{}')".format(
+                source_wfSetup.instance_id, source_wfSetup.nickname
+            )
+        )
+        sys.stderr.flush()
+        wfInstance = wfBackend.fromPreviousInstanceDeclaration(
+            source_wfInstance,
+            args.securityContextsConfigFilename,
+            nickname_prefix=args.nickname_prefix,
+            public_key_filenames=args.public_key_files,
+            private_key_filename=args.private_key_file,
+            private_key_passphrase=private_key_passphrase,
+            orcids=op_orcids,
+        )
+
     wfSetup = wfInstance.getStagedSetup()
     print("\t- Working directory will be {}".format(wfSetup.work_dir), file=sys.stderr)
     sys.stderr.flush()
@@ -1271,20 +1344,30 @@ def main() -> None:
     if command == WfExS_Commands.Export:
         sys.exit(processExportCommand(wfInstance, args, logLevel))
 
-    if command in (WfExS_Commands.Stage, WfExS_Commands.Execute):
+    if command in (
+        WfExS_Commands.Stage,
+        WfExS_Commands.ReStage,
+        WfExS_Commands.Execute,
+    ):
         print(
-            "\t- Instance {} (nickname '{}') (to be used with -J)".format(
+            "\t  Instance {} (nickname '{}') (to be used with -J)".format(
                 wfSetup.instance_id, wfSetup.nickname
             )
         )
         stagedSetup = wfInstance.stageWorkDir()
-        if command == WfExS_Commands.Stage:
+        if command != WfExS_Commands.Execute:
             print(
                 "\t- Instance {} (nickname '{}') is {} ready".format(
                     wfSetup.instance_id,
                     wfSetup.nickname,
                     "NOT" if stagedSetup.is_damaged else "now",
                 )
+            )
+            sys.exit(
+                1
+                if stagedSetup.is_damaged
+                or not isinstance(wfInstance.stageMarshalled, datetime.datetime)
+                else 0
             )
 
     # Depending on the parameters, it might not exist
@@ -1300,6 +1383,7 @@ def main() -> None:
             payloads=doMaterializedROCrate,
             licences=op_licences,
             orcids=op_orcids,
+            crate_pid=op_crate_pid,
         )
 
     if command in (WfExS_Commands.OfflineExecute, WfExS_Commands.Execute):
@@ -1328,6 +1412,7 @@ def main() -> None:
         wfInstance.createResultsResearchObject(
             payloads=doMaterializedROCrate,
             licences=op_licences,
+            crate_pid=op_crate_pid,
         )
 
 

@@ -30,7 +30,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import yaml
 
 from typing import (
@@ -48,7 +47,6 @@ from .common import (
     MaterializedContent,
     MaterializedInput,
     StagedExecution,
-    WorkflowType,
 )
 
 if TYPE_CHECKING:
@@ -79,7 +77,6 @@ if TYPE_CHECKING:
         ExpectedOutput,
         Fingerprint,
         MaterializedOutput,
-        MaterializedWorkflowEngine,
         RelPath,
         SymbolicParamName,
         URIType,
@@ -96,10 +93,12 @@ if TYPE_CHECKING:
 
 from .engine import WorkflowEngine, WorkflowEngineException
 from .engine import (
+    MaterializedWorkflowEngine,
+    STATS_DAG_DOT_FILE,
     WORKDIR_STATS_RELDIR,
     WORKDIR_STDOUT_FILE,
     WORKDIR_STDERR_FILE,
-    STATS_DAG_DOT_FILE,
+    WorkflowType,
 )
 from .fetchers.http import fetchClassicURL
 from .utils.contents import (
@@ -168,6 +167,7 @@ class NextflowWorkflowEngine(WorkflowEngine):
 
     def __init__(
         self,
+        container_type: "ContainerType" = ContainerType.NoContainer,
         cacheDir: "Optional[AnyPath]" = None,
         workflow_config: "Optional[Mapping[str, Any]]" = None,
         local_config: "Optional[EngineLocalConfig]" = None,
@@ -185,6 +185,7 @@ class NextflowWorkflowEngine(WorkflowEngine):
         config_directory: "Optional[AnyPath]" = None,
     ):
         super().__init__(
+            container_type=container_type,
             cacheDir=cacheDir,
             workflow_config=workflow_config,
             local_config=local_config,
@@ -1348,6 +1349,7 @@ STDERR
 
         # searching for process\..*container = ['"]([^'"]+)['"]
         containerTags: "MutableSequence[ContainerTaggedName]" = []
+        containerTagsConda: "MutableSequence[ContainerTaggedName]" = []
         containerTagSet: "Set[str]" = set()
         assert flat_stdout is not None
         self.logger.debug(f"nextflow config -flat {localWf.dir} => {flat_stdout}")
@@ -1367,7 +1369,9 @@ STDERR
                 tagged_container = self._genDockSingContainerTaggedName(
                     contMatch[1], container_registries
                 )
-                if tagged_container is not None:
+                if (tagged_container is not None) and (
+                    tagged_container not in containerTags
+                ):
                     containerTags.append(tagged_container)
 
         # Early DSL2 detection
@@ -1422,13 +1426,15 @@ STDERR
                             tagged_container = self._genDockSingContainerTaggedName(
                                 container_tag, container_registries
                             )
-                            if tagged_container is not None:
+                            if (tagged_container is not None) and (
+                                tagged_container not in containerTags
+                            ):
                                 containerTags.append(tagged_container)
                     # Conda
                     for conda_tag in processDecl.condas:
                         if conda_tag not in containerTagSet:
-                            containerTagSet.add(container_tag)
-                            containerTags.append(
+                            containerTagSet.add(conda_tag)
+                            containerTagsConda.append(
                                 ContainerTaggedName(
                                     origTaggedName=conda_tag,
                                     type=ContainerType.Conda,
@@ -1445,6 +1451,9 @@ STDERR
                             if isinstance(dslVerVal, list):
                                 dslVer = dslVerVal[0][1]
 
+        # Join both lists
+        if len(containerTagsConda) > 0:
+            containerTags.extend(containerTagsConda)
         return matWorkflowEngine, containerTags
 
     def simpleContainerFileName(self, imageUrl: "URIType") -> "RelPath":
@@ -1575,14 +1584,9 @@ STDERR
         assert localWf.relPath is not None
         assert isinstance(localWf.relPathFiles, list) and len(localWf.relPathFiles) > 0
 
-        outputDirPostfix = "_" + str(int(time.time()))
-        outputsDir = cast("AbsPath", os.path.join(self.outputsDir, outputDirPostfix))
-        os.makedirs(outputsDir, exist_ok=True)
-
         # These declarations provide a separate metadata directory for
         # each one of the executions of Nextflow
-        outputMetaDir = os.path.join(self.outputMetaDir, outputDirPostfix)
-        os.makedirs(outputMetaDir, exist_ok=True)
+        outputDirPostfix, outputsDir, outputMetaDir = self.create_job_directories()
         outputStatsDir = os.path.join(outputMetaDir, WORKDIR_STATS_RELDIR)
         os.makedirs(outputStatsDir, exist_ok=True)
 
@@ -1837,8 +1841,15 @@ wfexs_allParams()
             inputsFileName,
         ]
 
+        profile_input: "Optional[MaterializedInput]" = None
         if self.nxf_profile:
-            nxf_params.extend(["-profile", ",".join(self.nxf_profile)])
+            profile_input = MaterializedInput(
+                name=cast("SymbolicParamName", "-profile"),
+                values=[",".join(self.nxf_profile)],
+            )
+            nxf_params.extend(
+                [profile_input.name, cast("str", profile_input.values[0])]
+            )
 
         # Using the copy of the original workflow
         nxf_params.append(wDir)
@@ -1880,6 +1891,10 @@ wfexs_allParams()
         else:
             augmentedInputs = matInputs
 
+        # And it is wise to also preserve the used profiles
+        if profile_input is not None:
+            augmentedInputs = [profile_input, *augmentedInputs]
+
         # Creating the materialized outputs
         matOutputs = self.identifyMaterializedOutputs(matInputs, outputs, outputsDir)
 
@@ -1891,4 +1906,12 @@ wfexs_allParams()
             outputsDir=relOutputsDir,
             started=started,
             ended=ended,
+            # TODO: store the augmentedEnvironment instead
+            # of the materialized one
+            environment=matEnvironment,
+            diagram=cast("RelPath", os.path.relpath(dagFile, self.workDir)),
+            logfile=[
+                cast("RelPath", os.path.relpath(stdoutFilename, self.workDir)),
+                cast("RelPath", os.path.relpath(stderrFilename, self.workDir)),
+            ],
         )

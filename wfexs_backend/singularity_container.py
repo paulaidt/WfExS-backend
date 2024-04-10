@@ -33,8 +33,7 @@ from urllib import parse
 import uuid
 
 from .common import (
-    Container,
-    ContainerType,
+    META_JSON_POSTFIX,
     DEFAULT_SINGULARITY_CMD,
 )
 
@@ -76,13 +75,16 @@ if TYPE_CHECKING:
         alias: Required[Optional[str]]
         dcd: NotRequired[str]
         manifest: NotRequired[Mapping[str, Any]]
+        image_signature: NotRequired[Fingerprint]
 
 
 from .container import (
+    Container,
     ContainerFactory,
     ContainerEngineException,
     ContainerFactoryException,
     ContainerNotFoundException,
+    DOCKER_SCHEME,
 )
 
 from .utils.contents import link_or_copy
@@ -98,7 +100,7 @@ class FailedContainerTag(NamedTuple):
 class SingularityContainerFactory(ContainerFactory):
     ACCEPTED_SING_SCHEMES: "Final[Set[str]]" = {
         "library",
-        "docker",
+        DOCKER_SCHEME,
         "shub",
         "oras",
         "http",
@@ -385,14 +387,14 @@ STDERR
         parsedTag = parse.urlparse(tag_name)
         if parsedTag.scheme in self.ACCEPTED_SING_SCHEMES:
             singTag = tag_name
-            isDocker = parsedTag.scheme == "docker"
+            isDocker = parsedTag.scheme == DOCKER_SCHEME
         else:
             if parsedTag.scheme == "":
                 singTag = "docker://" + tag_name
                 parsedTag = parse.urlparse(singTag)
             else:
                 parsedTag = parsedTag._replace(
-                    scheme="docker",
+                    scheme=DOCKER_SCHEME,
                     netloc=parsedTag.scheme + ":" + parsedTag.path,
                     path="",
                 )
@@ -404,9 +406,9 @@ STDERR
         if (
             isDocker
             and isinstance(tag.registries, dict)
-            and (ContainerType.Docker in tag.registries)
+            and (common.ContainerType.Docker in tag.registries)
         ):
-            registry = tag.registries[ContainerType.Docker]
+            registry = tag.registries[common.ContainerType.Docker]
             # Bare case
             if len(parsedTag.path) <= 1:
                 singTag = f"docker://{registry}/library/{parsedTag.netloc}"
@@ -417,7 +419,7 @@ STDERR
             # Last case, it already has a registry declared
 
         containerFilename = simpleFileNameMethod(cast("URIType", tag_name))
-        containerFilenameMeta = containerFilename + self.META_JSON_POSTFIX
+        containerFilenameMeta = containerFilename + META_JSON_POSTFIX
         localContainerPath = cast(
             "AbsPath",
             os.path.join(self.engineContainersSymlinkDir, containerFilename),
@@ -620,20 +622,30 @@ STDERR
                         repo = metadata["repo"]
                         alias = metadata.get("alias")
                         partial_fingerprint = metadata.get("dcd")
+                        imageSignature_in_metadata = metadata.get("image_signature")
                         manifest = metadata.get("manifest")
                         if partial_fingerprint is not None:
                             fingerprint = cast(
-                                "Fingerprint", repo + "@" + partial_fingerprint
+                                # Maybe in the future registryServer + '/' + repo + "@" + partial_fingerprint
+                                "Fingerprint",
+                                repo + "@" + partial_fingerprint,
                             )
                         else:
                             # TODO: is there a better alternative?
                             fingerprint = cast("Fingerprint", tag_name)
+
+                        if imageSignature_in_metadata is not None:
+                            # Do the signatures match?
+                            fetch_metadata = (
+                                imageSignature != imageSignature_in_metadata
+                            )
                     else:
                         registryServer = ""
                         registryType = None
                         repo = ""
                         alias = ""
                         partial_fingerprint = ""
+                        imageSignature_in_metadata = None
                         manifest = None
                         fingerprint = cast("Fingerprint", tag_name)
             except Exception as e:
@@ -655,7 +667,7 @@ STDERR
                 tmpContainerPath = os.path.join(
                     self.containersCacheDir, str(uuid.uuid4())
                 )
-            tmpContainerPathMeta = tmpContainerPath + self.META_JSON_POSTFIX
+            tmpContainerPathMeta = tmpContainerPath + META_JSON_POSTFIX
 
             self.logger.debug(
                 f"downloading temporary container metadata: {tag_name} => {tmpContainerPathMeta}"
@@ -673,6 +685,7 @@ STDERR
                 tmp_meta: "SingularityManifest"
                 if tag_details is not None:
                     tmp_meta = {
+                        "image_signature": imageSignature,
                         "registryServer": tag_details.registryServer,
                         "registryType": "docker",
                         "repo": tag_details.repo,
@@ -687,6 +700,7 @@ STDERR
                 else:
                     # TODO: Which metadata could we add for other schemes?
                     tmp_meta = {
+                        "image_signature": imageSignature,
                         "registryServer": parsedTag.netloc,
                         "registryType": parsedTag.scheme,
                         "repo": singTag,
@@ -696,7 +710,7 @@ STDERR
                 json.dump(tmp_meta, tcpm)
 
             canonicalContainerPathMeta = cast(
-                "AbsPath", canonicalContainerPath + self.META_JSON_POSTFIX
+                "AbsPath", canonicalContainerPath + META_JSON_POSTFIX
             )
             shutil.move(tmpContainerPathMeta, canonicalContainerPathMeta)
 
@@ -737,6 +751,8 @@ STDERR
             localPath=containerPath,
             registries=tag.registries,
             metadataLocalPath=containerPathMeta,
+            source_type=tag.type,
+            image_signature=imageSignature,
         )
 
     def materializeContainers(
@@ -775,7 +791,8 @@ STDERR
             )
 
             if isinstance(matched_container, Container):
-                containersList.append(matched_container)
+                if matched_container not in containersList:
+                    containersList.append(matched_container)
             else:
                 notFoundContainersList.append(matched_container)
 

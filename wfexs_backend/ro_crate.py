@@ -17,11 +17,15 @@
 # limitations under the License.
 from __future__ import absolute_import
 
+import atexit
 import copy
+import enum
 import inspect
 import logging
 import os
 import pathlib
+import subprocess
+import tempfile
 from typing import (
     cast,
     NamedTuple,
@@ -52,7 +56,6 @@ if TYPE_CHECKING:
         AbsPath,
         AbstractGeneratedContent,
         AnyPath,
-        Container,
         ContainerEngineVersionStr,
         ContainerOperatingSystem,
         EngineVersion,
@@ -61,8 +64,8 @@ if TYPE_CHECKING:
         LocalWorkflow,
         MaterializedInput,
         MaterializedOutput,
-        MaterializedWorkflowEngine,
         ProcessorArchitecture,
+        ProgsMapping,
         RelPath,
         RemoteRepo,
         RepoTag,
@@ -73,6 +76,14 @@ if TYPE_CHECKING:
         URIType,
         WFLangVersion,
         WorkflowEngineVersionStr,
+    )
+
+    from .container import (
+        Container,
+    )
+
+    from .engine import (
+        MaterializedWorkflowEngine,
         WorkflowType,
     )
 
@@ -102,10 +113,6 @@ from rocrate.utils import (
     is_url,
 )
 
-from .cache_handler import (
-    META_JSON_POSTFIX,
-)
-
 from .fetchers import (
     FetcherException,
 )
@@ -127,21 +134,29 @@ from .utils.marshalling_handling import (
 )
 from .common import (
     AbstractWfExSException,
-    AcceptableLicenceSchemes,
     ContainerType,
     ContentKind,
     CratableItem,
+    DEFAULT_DOT_CMD,
     GeneratedContent,
     GeneratedDirectoryContent,
     MaterializedContent,
+    META_JSON_POSTFIX,
     NoCratableItem,
+    NoLicence,
+)
+
+from .utils.licences import (
+    AcceptableLicenceSchemes,
     NoLicenceShort,
+    CC_BY_40_LICENCE,
+    ROCrateLongLicences,
     ROCrateShortLicences,
 )
 
 from . import __url__ as wfexs_backend_url
 from . import __official_name__ as wfexs_backend_name
-from . import get_WfExS_version
+from . import get_WfExS_version_str
 
 
 class ROCrateGenerationException(AbstractWfExSException):
@@ -160,7 +175,9 @@ class FormalParameter(rocrate.model.entity.Entity):  # type: ignore[misc]
         fp_properties = {
             "name": name,
             # As of https://www.researchobject.org/ro-crate/1.1/workflows.html#describing-inputs-and-outputs
-            "conformsTo": "https://bioschemas.org/profiles/FormalParameter/1.0-RELEASE/",
+            "conformsTo": {
+                "@id": "https://bioschemas.org/profiles/FormalParameter/1.0-RELEASE/",
+            },
         }
 
         if additional_type is not None:
@@ -326,8 +343,118 @@ class FixedFile(FixedMixin, rocrate.model.file.File):  # type: ignore[misc]
     pass
 
 
-class SoftwareContainer(FixedFile):  # type: ignore[misc]
-    TYPES = ["File", "SoftwareApplication"]
+WORKFLOW_RUN_CONTEXT: "Final[str]" = "https://w3id.org/ro/terms/workflow-run"
+
+
+class ContainerImageAdditionalType(enum.Enum):
+    Docker = WORKFLOW_RUN_CONTEXT + "#DockerImage"
+    Singularity = WORKFLOW_RUN_CONTEXT + "#SIFImage"
+
+
+ContainerType2AdditionalType: "Mapping[ContainerType, ContainerImageAdditionalType]" = {
+    ContainerType.Docker: ContainerImageAdditionalType.Docker,
+    ContainerType.Singularity: ContainerImageAdditionalType.Singularity,
+    ContainerType.Podman: ContainerImageAdditionalType.Docker,
+}
+
+
+class ContainerImage(rocrate.model.entity.Entity):  # type: ignore[misc]
+    TYPES = ["ContainerImage", "SoftwareApplication"]
+
+    def __init__(
+        self,
+        crate: "rocrate.rocrate.ROCrate",
+        name: "str",
+        container_type: "ContainerType",
+        registry: "Optional[str]" = None,
+        tag: "Optional[str]" = None,
+        identifier: "Optional[str]" = None,
+        properties: "Optional[Mapping[str, Any]]" = None,
+    ):
+        fp_properties = self._prepare_properties(
+            name,
+            container_type,
+            registry=registry,
+            tag=tag,
+            properties=properties,
+        )
+        super().__init__(crate, identifier=identifier, properties=fp_properties)
+
+    def _empty(self) -> "Mapping[str, Any]":
+        return {
+            "@id": self.id,
+            "@type": self.TYPES[:],
+        }
+
+    @staticmethod
+    def _prepare_properties(
+        name: "str",
+        container_type: "ContainerType",
+        registry: "Optional[str]" = None,
+        tag: "Optional[str]" = None,
+        properties: "Optional[Mapping[str, Any]]" = None,
+    ) -> "Mapping[str, Any]":
+        additional_type = ContainerType2AdditionalType.get(container_type)
+        if additional_type is None:
+            raise ValueError(
+                f"Unable to map container type {container_type.value} to an RO-Crate equivalent"
+            )
+        fp_properties = {
+            "name": name,
+            "additionalType": {
+                "@id": additional_type.value,
+            },
+        }
+
+        if registry is not None:
+            fp_properties["registry"] = registry
+
+        if tag is not None:
+            fp_properties["tag"] = tag
+
+        if properties is not None:
+            fp_properties.update(properties)
+
+        return fp_properties
+
+
+# Multiple inheritance order does matter when super is called!!!!
+class MaterializedContainerImage(ContainerImage, FixedFile):  # type: ignore[misc]
+    TYPES = ["File", "ContainerImage", "SoftwareApplication"]
+
+    def __init__(
+        self,
+        crate: "rocrate.rocrate.ROCrate",
+        container_type: "ContainerType",
+        registry: "Optional[str]" = None,
+        name: "str" = "",
+        tag: "Optional[str]" = None,
+        identifier: "Optional[str]" = None,
+        source: "Optional[Union[str, pathlib.Path]]" = None,
+        dest_path: "Optional[Union[str, pathlib.Path]]" = None,
+        properties: "Optional[Mapping[str, Any]]" = None,
+    ):
+        fp_properties = self._prepare_properties(
+            name,
+            container_type,
+            registry=registry,
+            tag=tag,
+            properties=properties,
+        )
+
+        super(FixedFile, self).__init__(
+            crate=crate,
+            source=source,
+            dest_path=dest_path,
+            identifier=identifier,
+            fetch_remote=False,
+            validate_url=False,
+            properties=fp_properties,
+        )
+
+
+class WorkflowDiagram(FixedFile):  # type: ignore[misc]
+    TYPES = ["File", "ImageObject"]
 
     def _empty(self) -> "Mapping[str, Any]":
         return {
@@ -603,6 +730,10 @@ class WorkflowRunROCrate:
         payloads: "CratableItem" = NoCratableItem,
         licences: "Sequence[str]" = [],
         orcids: "Sequence[str]" = [],
+        progs: "ProgsMapping" = {},
+        tempdir: "Optional[str]" = None,
+        scheme_desc: "Sequence[Tuple[str, str]]" = [],
+        crate_pid: "Optional[str]" = None,
     ):
         # Getting a logger focused on specific classes
         self.logger = logging.getLogger(
@@ -611,6 +742,13 @@ class WorkflowRunROCrate:
             + self.__class__.__name__
         )
 
+        # Saving the path to needed programs
+        # (right now "dot" to translate the diagram)
+        self.dot_binary = progs.get(DEFAULT_DOT_CMD, DEFAULT_DOT_CMD)
+
+        # Where should be place generated temporary files?
+        self.tempdir = tempdir
+
         self.cached_cts: "MutableMapping[ContainerType, rocrate.model.softwareapplication.SoftwareApplication]" = (
             {}
         )
@@ -618,10 +756,11 @@ class WorkflowRunROCrate:
         # This is used to avoid including twice the very same value
         # in the RO-Crate
         self._item_hash: "MutableMapping[bytes, rocrate.model.entity.Entity]" = {}
-        self._wf_to_containers: "MutableMapping[str, MutableSequence[Union[rocrate.model.softwareapplication.SoftwareApplication, SoftwareContainer]]]" = (
+        self._added_containers: "MutableSequence[Container]" = []
+        self._wf_to_containers: "MutableMapping[str, MutableSequence[ContainerImage]]" = (
             {}
         )
-        self._wf_to_operational_containers: "MutableMapping[str, MutableSequence[Union[rocrate.model.softwareapplication.SoftwareApplication, SoftwareContainer]]]" = (
+        self._wf_to_operational_containers: "MutableMapping[str, MutableSequence[ContainerImage]]" = (
             {}
         )
         self._wf_to_container_sa: "MutableMapping[str, rocrate.model.softwareapplication.SoftwareApplication]" = (
@@ -652,6 +791,7 @@ class WorkflowRunROCrate:
             materializedEngine.instance.workflowType,
             localWorkflow.langVersion,
             licences,
+            crate_pid=crate_pid,
         )
 
         # add agents
@@ -703,7 +843,7 @@ class WorkflowRunROCrate:
                 f"{len(failed_orcids)} of {len(orcids)} ORCIDs were not valid: {', '.join(failed_orcids)}"
             )
 
-        self.wf_wfexs = self._add_wfexs_to_crate()
+        self.wf_wfexs = self._add_wfexs_to_crate(scheme_desc)
 
         # Description of the workflow engine as a software application
         self.weng_crate = rocrate.model.softwareapplication.SoftwareApplication(
@@ -712,6 +852,13 @@ class WorkflowRunROCrate:
         self.crate.add(self.weng_crate)
         if workflowEngineVersion is not None:
             self.weng_crate["softwareVersion"] = workflowEngineVersion
+
+        # It should have the operational containers
+        if materializedEngine.operational_containers is not None:
+            self._add_containers(
+                materializedEngine.operational_containers,
+                sa_crate=self.weng_crate,
+            )
 
         # TODO: research why relPathFiles is not populated sometimes in matWf
         matWf = materializedEngine.workflow
@@ -731,6 +878,7 @@ class WorkflowRunROCrate:
             remote_repo=remote_repo,
             gen_cwl=False,
             do_attach=CratableItem.Workflow in payloads,
+            was_workflow_run=ran_is_original,
         )
 
         ran_workflow_crate: "FixedWorkflow"
@@ -752,17 +900,17 @@ class WorkflowRunROCrate:
             wf_consolidate_action = self.crate.add(wf_consolidate_action)
             wf_consolidate_action["object"] = original_workflow_crate
             wf_consolidate_action["result"] = ran_workflow_crate
-            instruments: "MutableSequence[rocrate.model.entity.Entity]" = [
-                self.wf_wfexs,
-                self.weng_crate,
-            ]
-            if ran_workflow_crate.id in self._wf_to_operational_containers:
-                if ran_workflow_crate.id in self._wf_to_container_sa:
-                    instruments.append(self._wf_to_container_sa[ran_workflow_crate.id])
-                instruments.extend(
-                    self._wf_to_operational_containers[ran_workflow_crate.id]
-                )
-            wf_consolidate_action.append_to("instrument", instruments, compact=True)
+            # instruments: "MutableSequence[rocrate.model.entity.Entity]" = [
+            #     self.wf_wfexs,
+            #     self.weng_crate,
+            # ]
+            # if ran_workflow_crate.id in self._wf_to_operational_containers:
+            #     if ran_workflow_crate.id in self._wf_to_container_sa:
+            #         instruments.append(self._wf_to_container_sa[ran_workflow_crate.id])
+            #     instruments.extend(
+            #         self._wf_to_operational_containers[ran_workflow_crate.id]
+            #     )
+            wf_consolidate_action.append_to("instrument", self.wf_wfexs, compact=True)
             wf_consolidate_action.append_to(
                 "actionStatus",
                 {"@id": "http://schema.org/CompletedActionStatus"},
@@ -787,6 +935,7 @@ class WorkflowRunROCrate:
         wf_type: "WorkflowType",
         langVersion: "Optional[Union[EngineVersion, WFLangVersion]]",
         licences: "Sequence[str]",
+        crate_pid: "Optional[str]",
     ) -> "None":
         """
         Due the internal synergies between an instance of ComputerLanguage
@@ -810,11 +959,27 @@ class WorkflowRunROCrate:
             )
 
         self.crate = FixedROCrate(gen_preview=False)
+        if crate_pid is not None:
+            self.crate.root_dataset.append_to("identifier", crate_pid, compact=True)
+
+        RO_licences = self._process_licences(licences)
 
         # Add extra terms
-        self.crate.metadata.extra_terms.update(
-            {"sha256": "https://w3id.org/ro/terms/workflow-run#sha256"}
-        )
+        # self.crate.metadata.extra_terms.update(
+        #     {
+        #         "sha256": WORKFLOW_RUN_CONTEXT + "#sha256",
+        #         # Next ones are experimental
+        #         ContainerImageAdditionalType.Docker.value: WORKFLOW_RUN_CONTEXT + "#"
+        #         + ContainerImageAdditionalType.Docker.value,
+        #         ContainerImageAdditionalType.Singularity.value: WORKFLOW_RUN_CONTEXT + "#"
+        #         + ContainerImageAdditionalType.Singularity.value,
+        #         "containerImage": WORKFLOW_RUN_CONTEXT + "#containerImage",
+        #         "ContainerImage": WORKFLOW_RUN_CONTEXT + "#ContainerImage",
+        #         "registry": WORKFLOW_RUN_CONTEXT + "#registry",
+        #         "tag": WORKFLOW_RUN_CONTEXT + "#tag",
+        #     }
+        # )
+        self.crate.metadata.extra_contexts.append(WORKFLOW_RUN_CONTEXT)
 
         self.compLang = rocrate.model.computerlanguage.ComputerLanguage(
             self.crate,
@@ -828,31 +993,112 @@ class WorkflowRunROCrate:
             },
         )
         self.crate.description = f"RO-Crate from staged WfExS working directory {self.staged_setup.instance_id} ({self.staged_setup.nickname})"
-        self.crate.license = licences
+        self.crate.root_dataset.append_to("license", RO_licences, compact=True)
         # This should not be needed, as it is added later
         self.crate.add(self.compLang)
 
+    def _process_licences(
+        self, licences: "Sequence[str]"
+    ) -> "Sequence[Union[str, rocrate.model.creativework.CreativeWork]]":
+        RO_licences: "MutableSequence[Union[str, rocrate.model.creativework.CreativeWork]]" = (
+            []
+        )
+        for lic in licences:
+            RO_licences.append(self._process_licence(lic))
+
+        return RO_licences
+
+    def _process_licence(
+        self, licence: "str"
+    ) -> "Union[str, rocrate.model.creativework.CreativeWork]":
+        # In order to avoid so prominent "No Permission url"
+        if licence == NoLicence:
+            licence = NoLicenceShort
+
+        parsed_lic: "Union[str, rocrate.model.creativework.CreativeWork]"
+        rec_lic: "bool" = False
+        if licence in ROCrateShortLicences:
+            if licence == NoLicenceShort:
+                parsed_lic = licence
+            else:
+                licdesc = ROCrateShortLicences[licence]
+                cw = cast(
+                    "Optional[rocrate.model.creativework.CreativeWork]",
+                    self.crate.dereference(licdesc.uri),
+                )
+                if cw is None:
+                    rec_lic = True
+                    parsed_lic = rocrate.model.creativework.CreativeWork(
+                        self.crate,
+                        identifier=licdesc.uri,
+                        properties={
+                            "identifier": licdesc.uri,
+                            "name": licdesc.description,
+                        },
+                    )
+                else:
+                    parsed_lic = cw
+        elif licence in ROCrateLongLicences:
+            licdesc = ROCrateLongLicences[licence]
+            cw = cast(
+                "Optional[rocrate.model.creativework.CreativeWork]",
+                self.crate.dereference(licdesc.uri),
+            )
+            if cw is None:
+                rec_lic = True
+                parsed_lic = rocrate.model.creativework.CreativeWork(
+                    self.crate,
+                    identifier=licdesc.uri,
+                    properties={
+                        "identifier": licdesc.uri,
+                        "name": licdesc.description,
+                    },
+                )
+            else:
+                parsed_lic = cw
+        else:
+            cw = cast(
+                "Optional[rocrate.model.creativework.CreativeWork]",
+                self.crate.dereference(licence),
+            )
+            if cw is None:
+                rec_lic = True
+                parsed_lic = rocrate.model.creativework.CreativeWork(
+                    self.crate,
+                    identifier=licence,
+                    properties={
+                        "identifier": licence,
+                    },
+                )
+            else:
+                parsed_lic = cw
+
+        if rec_lic and isinstance(parsed_lic, rocrate.model.creativework.CreativeWork):
+            self.crate.add(parsed_lic)
+
+        return parsed_lic
+
     def _add_wfexs_to_crate(
-        self,
+        self, scheme_desc: "Sequence[Tuple[str, str]]"
     ) -> "rocrate.model.softwareapplication.SoftwareApplication":
         # First, the profiles to be attached to the root dataset
         wrroc_profiles = [
             rocrate.model.creativework.CreativeWork(
                 self.crate,
-                identifier="https://w3id.org/ro/wfrun/process/0.2",
-                properties={"name": "ProcessRun Crate", "version": "0.2"},
+                identifier="https://w3id.org/ro/wfrun/process/0.3",
+                properties={"name": "ProcessRun Crate", "version": "0.3"},
             ),
             rocrate.model.creativework.CreativeWork(
                 self.crate,
-                identifier="https://w3id.org/ro/wfrun/workflow/0.2",
-                properties={"name": "Workflow Run Crate", "version": "0.2"},
+                identifier="https://w3id.org/ro/wfrun/workflow/0.3",
+                properties={"name": "Workflow Run Crate", "version": "0.3"},
             ),
             # TODO: This one can be enabled only when proper provenance
             # describing the execution steps is implemented
             # rocrate.model.creativework.CreativeWork(
             #     self.crate,
-            #     identifier="https://w3id.org/ro/wfrun/provenance/0.2",
-            #     properties={"name": "Provenance Run Crate", "version": "0.2"},
+            #     identifier="https://w3id.org/ro/wfrun/provenance/0.3",
+            #     properties={"name": "Provenance Run Crate", "version": "0.3"},
             # ),
             rocrate.model.creativework.CreativeWork(
                 self.crate,
@@ -870,33 +1116,81 @@ class WorkflowRunROCrate:
         wf_wfexs = self.crate.add(wf_wfexs)
         wf_wfexs["name"] = wfexs_backend_name
         wf_wfexs.url = wfexs_backend_url
-        wfexs_version = get_WfExS_version()
-        if wfexs_version[1] is None:
-            verstr = wfexs_version[0]
-        else:
-            verstr = "{0[0]} ({0[1]})".format(wfexs_version)
+        verstr = get_WfExS_version_str()
         wf_wfexs["softwareVersion"] = verstr
+
+        # And the README.md
+        readme_md_handle, readme_md_path = tempfile.mkstemp(
+            prefix="WfExS", suffix="README", dir=self.tempdir
+        )
+        # Registering for removal the temporary file
+        atexit.register(os.unlink, readme_md_path)
+        with os.fdopen(readme_md_handle, mode="w", encoding="utf-8") as wMD:
+            scheme_desc_str = "\n\n* ".join(
+                map(lambda sd: f"`{sd[0]}`: {sd[1]}", scheme_desc)
+            )
+            print(
+                f"""\
+# Notes about this generated RO-Crate
+
+{self.crate.description}
+
+This RO-Crate has been generated by {wfexs_backend_name} {verstr} ,
+whose sources are available at {wfexs_backend_url}.
+
+## Software containers and metadata
+
+Metadata files which are produced and consumed by {wfexs_backend_name} in
+order to properly detect when a local cached copy of a software container
+is stale are also included in this RO-Crate. These files are in JSON format.
+
+In case this RO-Crate also contains a copy of the software containers,
+their format will depend on whether they are going to be consumed by
+Singularity / Apptainer, or they are going to be consumed by Docker or Podman.
+
+Singularity / Apptainer images usually have the singularity image format.
+
+Both Docker and Podman images are compressed tar archives obtained through
+either `docker save` or `podman save` commands. These archives have all
+the layers needed to restore the container image in a local registry
+through either `docker load` or `podman load`.
+
+## Posibly used URI schemes
+
+As {wfexs_backend_name} is able to manage several exotic CURIEs and schemes,
+you can find here an almost complete list of the possible ones:
+
+* {scheme_desc_str}
+""",
+                file=wMD,
+            )
+
+        readme_file = self._add_file_to_crate(
+            readme_md_path,
+            the_uri=None,
+            the_name=cast("RelPath", "README.md"),
+            the_mime="text/markdown",
+            the_licences=[CC_BY_40_LICENCE],
+        )
+        readme_file.append_to("about", self.crate.root_dataset, compact=True)
 
         return wf_wfexs
 
-    def _add_containers_to_workflow(
+    def _add_containers(
         self,
         containers: "Sequence[Container]",
-        the_workflow_crate: "FixedWorkflow",
-        weng_crate: "Optional[rocrate.model.softwareapplication.SoftwareApplication]" = None,
-    ) -> "MutableSequence[Union[rocrate.model.softwareapplication.SoftwareApplication, SoftwareContainer]]":
+        sa_crate: "Union[rocrate.model.computationalworkflow.ComputationalWorkflow, rocrate.model.softwareapplication.SoftwareApplication]",
+        the_workflow_crate: "Optional[FixedWorkflow]" = None,
+    ) -> "MutableSequence[ContainerImage]":
         # Operational containers are needed by the workflow engine, not by the workflow
-        added_containers: "MutableSequence[Union[rocrate.model.softwareapplication.SoftwareApplication, SoftwareContainer]]" = (
-            []
-        )
+        added_containers: "MutableSequence[ContainerImage]" = []
         if len(containers) > 0:
             do_attach = CratableItem.Containers in self.payloads
-            sa_crate: "Union[rocrate.model.computationalworkflow.ComputationalWorkflow, rocrate.model.softwareapplication.SoftwareApplication]"
-            if weng_crate is not None:
-                sa_crate = weng_crate
-            else:
-                sa_crate = the_workflow_crate
             for container in containers:
+                # Skip early what it was already included in the crate
+                if container in self._added_containers:
+                    continue
+
                 container_type_metadata = self.ContainerTypeMetadataDetails[
                     container.type
                 ]
@@ -918,25 +1212,94 @@ class WorkflowRunROCrate:
                     self.cached_cts[container.type] = crate_cont_type
 
                 # Saving it for later usage when CreateAction are declared
-                if the_workflow_crate.id not in self._wf_to_container_sa:
+                if (
+                    the_workflow_crate is not None
+                    and the_workflow_crate.id not in self._wf_to_container_sa
+                ):
                     self._wf_to_container_sa[the_workflow_crate.id] = crate_cont_type
 
-                software_container: "Union[rocrate.model.softwareapplication.SoftwareApplication, SoftwareContainer]"
+                # And the container source type
+                crate_source_cont_type: "Optional[rocrate.model.softwareapplication.SoftwareApplication]"
+                if (
+                    container.source_type is None
+                    or container.source_type == container.type
+                ):
+                    crate_source_cont_type = crate_cont_type
+                    container_source_type_metadata = container_type_metadata
+                else:
+                    container_source_type_metadata = self.ContainerTypeMetadataDetails[
+                        container.source_type
+                    ]
+                    crate_source_cont_type = self.cached_cts.get(container.source_type)
+                    if crate_source_cont_type is None:
+                        container_source_type = (
+                            rocrate.model.softwareapplication.SoftwareApplication(
+                                self.crate,
+                                identifier=container_source_type_metadata.sa_id,
+                            )
+                        )
+                        container_source_type[
+                            "applicationCategory"
+                        ] = container_source_type_metadata.ct_applicationCategory
+                        container_source_type["name"] = container.source_type.value
+
+                        crate_source_cont_type = self.crate.add(container_source_type)
+                        self.cached_cts[container.source_type] = crate_source_cont_type
+
+                software_container: "ContainerImage"
+                registry, tag_name, tag_label = container.decompose_docker_tagged_name
+                original_container_type = (
+                    container.source_type
+                    if container.source_type is not None
+                    else container.type
+                )
+                upper_properties = {}
+                # This is for the cases where we have the docker image fingerprint
+                # This sha256 is about the image, but it is not associated
+                # to the physical image when it is materialized in some way
+                # like docker save or singularity pull
+                if (
+                    container.fingerprint is not None
+                    and "@sha256:" in container.fingerprint
+                ):
+                    _, upper_properties["sha256"] = container.fingerprint.split(
+                        "@sha256:", 1
+                    )
+                software_container = ContainerImage(
+                    self.crate,
+                    identifier=container.taggedName,
+                    registry=registry,
+                    name=tag_name,
+                    tag=tag_label,
+                    container_type=original_container_type,
+                    properties=upper_properties,
+                )
                 if do_attach and container.localPath is not None:
                     the_size = os.stat(container.localPath).st_size
-                    assert container.signature is not None
-                    digest, algo = extract_digest(container.signature)
-                    if digest is None:
-                        digest, algo = unstringifyDigest(container.signature)
-                    assert algo is not None
-                    the_signature = hexDigest(algo, digest)
+                    if container.image_signature is not None:
+                        digest, algo = extract_digest(container.image_signature)
+                        if digest is None:
+                            digest, algo = unstringifyDigest(container.image_signature)
+                        assert algo is not None
+                        the_signature = hexDigest(algo, digest)
+                    else:
+                        the_signature = cast(
+                            "Fingerprint",
+                            ComputeDigestFromFile(
+                                container.localPath,
+                                "sha256",
+                                repMethod=hexDigest,
+                            ),
+                        )
 
-                    software_container = SoftwareContainer(
+                    materialized_software_container = MaterializedContainerImage(
                         self.crate,
                         source=container.localPath,
                         dest_path=os.path.relpath(container.localPath, self.work_dir),
-                        fetch_remote=False,
-                        validate_url=False,
+                        container_type=container.type,
+                        registry=registry,
+                        name=tag_name,
+                        tag=tag_label,
                         properties={
                             "contentSize": str(the_size),
                             "identifier": container.taggedName,
@@ -946,56 +1309,86 @@ class WorkflowRunROCrate:
                             ),
                         },
                     )
+                    materialized_software_container = self.crate.add(
+                        materialized_software_container
+                    )
 
-                else:
-                    container_pid = container.taggedName
-                    software_container = (
-                        rocrate.model.softwareapplication.SoftwareApplication(
-                            self.crate, identifier=container_pid
+                    container_consolidate_action = CreateAction(
+                        self.crate, f"Materialize {container.taggedName}"
+                    )
+                    container_consolidate_action = self.crate.add(
+                        container_consolidate_action
+                    )
+                    container_consolidate_action["object"] = software_container
+                    container_consolidate_action[
+                        "result"
+                    ] = materialized_software_container
+                    container_consolidate_action.append_to(
+                        "instrument", crate_cont_type, compact=True
+                    )
+                    container_consolidate_action.append_to(
+                        "actionStatus",
+                        {"@id": "http://schema.org/CompletedActionStatus"},
+                        compact=True,
+                    )
+
+                crate_cont = self.crate.dereference(software_container.id)
+                if crate_cont is None:
+                    # Record the container
+                    self._added_containers.append(container)
+
+                    # Now, add container metadata, which is going to be
+                    # consumed by WfExS or third parties
+                    metadataLocalPath: "Optional[str]" = None
+                    if container.metadataLocalPath is not None:
+                        metadataLocalPath = container.metadataLocalPath
+                    # This code is needed for old working directories
+                    if metadataLocalPath is None and container.localPath is not None:
+                        metadataLocalPath = container.localPath + META_JSON_POSTFIX
+
+                    if metadataLocalPath is not None and os.path.exists(
+                        metadataLocalPath
+                    ):
+                        meta_file = self._add_file_to_crate(
+                            the_path=metadataLocalPath,
+                            the_uri=None,
+                            the_name=cast(
+                                "RelPath",
+                                os.path.relpath(metadataLocalPath, self.work_dir),
+                            ),
                         )
-                    )
+                        meta_file.append_to("about", software_container, compact=True)
 
-                # Now, add container metadata, which is going to be
-                # consumed by WfExS or third parties
-                metadataLocalPath: "Optional[str]" = None
-                if container.metadataLocalPath is not None:
-                    metadataLocalPath = container.metadataLocalPath
-                # This code is needed for old working directories
-                if metadataLocalPath is None and container.localPath is not None:
-                    metadataLocalPath = container.localPath + META_JSON_POSTFIX
+                    software_container["softwareVersion"] = container.fingerprint
+                    container_os = container.operatingSystem
+                    if container_os is None:
+                        container_os = self.containerEngineOs
+                    if container_os is not None:
+                        software_container["operatingSystem"] = container_os
+                    # Getting the processor architecture of the container
+                    container_arch = container.architecture
+                    if container_arch is None:
+                        container_arch = self.arch
+                    if container_arch is not None:
+                        software_container["processorRequirements"] = container_arch
+                    software_container["softwareRequirements"] = crate_cont_type
 
-                if metadataLocalPath is not None and os.path.exists(metadataLocalPath):
-                    meta_file = self._add_file_to_crate(
-                        the_path=metadataLocalPath,
-                        the_uri=None,
-                        the_name=cast(
-                            "RelPath", os.path.relpath(metadataLocalPath, self.work_dir)
-                        ),
-                    )
-                    software_container.append_to("hasPart", meta_file, compact=True)
-                    meta_file.append_to("about", software_container, compact=True)
+                    # Describing the the kind of container
+                    software_container[
+                        "applicationCategory"
+                    ] = container_type_metadata.applicationCategory
 
-                software_container["softwareVersion"] = container.fingerprint
-                container_os = container.operatingSystem
-                if container_os is None:
-                    container_os = self.containerEngineOs
-                if container_os is not None:
-                    software_container["operatingSystem"] = container_os
-                # Getting the processor architecture of the container
-                container_arch = container.architecture
-                if container_arch is None:
-                    container_arch = self.arch
-                if container_arch is not None:
-                    software_container["processorRequirements"] = container_arch
-                software_container["softwareRequirements"] = crate_cont_type
+                    crate_cont = self.crate.add(software_container)
 
-                # Describing the the kind of container
-                software_container[
-                    "applicationCategory"
-                ] = container_type_metadata.applicationCategory
+                    # We are assuming these are operational containers
+                    if isinstance(
+                        sa_crate, rocrate.model.softwareapplication.SoftwareApplication
+                    ):
+                        sa_crate.append_to(
+                            "softwareRequirements", crate_cont, compact=True
+                        )
 
-                crate_cont = self.crate.add(software_container)
-                added_containers.append(crate_cont)
+                added_containers.append(cast("ContainerImage", crate_cont))
 
         return added_containers
 
@@ -1084,7 +1477,15 @@ class WorkflowRunROCrate:
                         assert isinstance(itemInValues, MaterializedContent)
                         itemInLocalSource = itemInValues.local  # local source
                         itemInURISource = itemInValues.licensed_uri.uri  # uri source
+                        itemInURILicences = itemInValues.licensed_uri.licences
                         if os.path.isfile(itemInLocalSource):
+                            the_signature: "Optional[Fingerprint]" = None
+                            if itemInValues.fingerprint is not None:
+                                digest, algo = extract_digest(itemInValues.fingerprint)
+                                if digest is not None:
+                                    assert algo is not None
+                                    the_signature = hexDigest(algo, digest)
+
                             # This is needed to avoid including the input
                             crate_file = self._add_file_to_crate(
                                 the_path=itemInLocalSource,
@@ -1093,6 +1494,8 @@ class WorkflowRunROCrate:
                                     "RelPath",
                                     os.path.relpath(itemInLocalSource, self.work_dir),
                                 ),
+                                the_signature=the_signature,
+                                the_licences=itemInURILicences,
                                 do_attach=do_attach,
                             )
 
@@ -1265,8 +1668,22 @@ class WorkflowRunROCrate:
 
                             secInputLocalSource = secInput.local  # local source
                             secInputURISource = secInput.licensed_uri.uri  # uri source
+                            secInputURILicences = (
+                                secInput.licensed_uri.licences
+                            )  # licences
                             if os.path.isfile(secInputLocalSource):
                                 # This is needed to avoid including the input
+                                the_sec_signature: "Optional[Fingerprint]" = None
+                                if secInput.fingerprint is not None:
+                                    sec_digest, sec_algo = extract_digest(
+                                        secInput.fingerprint
+                                    )
+                                    if sec_digest is not None:
+                                        assert sec_algo is not None
+                                        the_sec_signature = hexDigest(
+                                            sec_algo, sec_digest
+                                        )
+
                                 sec_crate_elem = self._add_file_to_crate(
                                     the_path=secInputLocalSource,
                                     the_uri=secInputURISource,
@@ -1276,6 +1693,8 @@ class WorkflowRunROCrate:
                                             secInputLocalSource, self.work_dir
                                         ),
                                     ),
+                                    the_signature=the_sec_signature,
+                                    the_licences=secInputURILicences,
                                     do_attach=do_attach,
                                 )
 
@@ -1314,11 +1733,27 @@ class WorkflowRunROCrate:
                 if item_signature not in self._item_hash:
                     self._item_hash[item_signature] = crate_coll
 
-                if formal_parameter not in crate_coll.get("exampleOfWork", []):
+                examples_of_work = crate_coll.get("exampleOfWork")
+                if (
+                    examples_of_work is None
+                    or formal_parameter != examples_of_work
+                    or (
+                        isinstance(examples_of_work, list)
+                        and formal_parameter not in examples_of_work
+                    )
+                ):
                     crate_coll.append_to(
                         "exampleOfWork", formal_parameter, compact=True
                     )
-                if crate_coll not in formal_parameter.get("workExample", []):
+                work_examples = formal_parameter.get("workExample")
+                if (
+                    work_examples is None
+                    or crate_coll != work_examples
+                    or (
+                        isinstance(work_examples, list)
+                        and crate_coll not in work_examples
+                    )
+                ):
                     formal_parameter.append_to("workExample", crate_coll, compact=True)
                 crate_inputs.append(crate_coll)
 
@@ -1334,6 +1769,8 @@ class WorkflowRunROCrate:
         the_alternate_name: "Optional[RelPath]" = None,
         the_size: "Optional[int]" = None,
         the_signature: "Optional[Fingerprint]" = None,
+        the_licences: "Optional[Sequence[str]]" = None,
+        the_mime: "Optional[str]" = None,
         is_soft_source: "bool" = False,
         do_attach: "bool" = True,
     ) -> "FixedFile":
@@ -1374,15 +1811,19 @@ class WorkflowRunROCrate:
             )
         the_file_crate.append_to("contentSize", str(the_size), compact=True)
         the_file_crate.append_to("sha256", the_signature, compact=True)
-        the_file_crate.append_to(
-            "encodingFormat",
+        if the_mime is None:
             # Real path is needed because libmagic is able to provide
             # a mime type for symbolic links, and some engines and
             # workflows provide their outputs symbolically linked to
             # the file in the intermediate working directory
-            magic.from_file(os.path.realpath(the_path), mime=True),
-            compact=True,
-        )
+            the_mime = magic.from_file(os.path.realpath(the_path), mime=True)
+        the_file_crate.append_to("encodingFormat", the_mime, compact=True)
+
+        if the_licences is not None:
+            for the_licence in the_licences:
+                the_file_crate.append_to(
+                    "license", self._process_licence(the_licence), compact=True
+                )
 
         return the_file_crate
 
@@ -1492,6 +1933,7 @@ class WorkflowRunROCrate:
         main: "bool" = False,
         gen_cwl: "bool" = False,
         do_attach: "bool" = True,
+        was_workflow_run: "bool" = True,
     ) -> "FixedWorkflow":
         # Determining the absolute path of the workflow
         the_path: "str"
@@ -1639,31 +2081,44 @@ class WorkflowRunROCrate:
         if workflow_engine_version is not None:
             the_workflow_crate["runtimePlatform"] = workflow_engine_version
 
+        # This is a property from SoftwareSourceCode
+        # the_workflow_crate["targetProduct"] = the_weng_crate
+
         if materialized_engine.containers is not None:
-            added_containers = self._add_containers_to_workflow(
+            added_containers = self._add_containers(
                 materialized_engine.containers,
-                the_workflow_crate,
+                sa_crate=the_workflow_crate,
+                the_workflow_crate=the_workflow_crate,
             )
-            existing_containers = self._wf_to_containers.get(the_workflow_crate.id, [])
+            if was_workflow_run and len(added_containers) > 0:
+                the_workflow_crate.append_to(
+                    "softwareRequirements",
+                    self._wf_to_container_sa[the_workflow_crate.id],
+                    compact=True,
+                )
+            existing_containers = self._wf_to_containers.setdefault(
+                the_workflow_crate.id, []
+            )
             for added_container in added_containers:
+                # Add containers as addons which were used
                 if added_container not in existing_containers:
                     existing_containers.append(added_container)
-            self._wf_to_containers[the_workflow_crate.id] = existing_containers
+                    if was_workflow_run:
+                        the_workflow_crate.append_to(
+                            "softwareRequirements", added_container, compact=True
+                        )
         if materialized_engine.operational_containers is not None:
-            added_operational_containers = self._add_containers_to_workflow(
+            added_operational_containers = self._add_containers(
                 materialized_engine.operational_containers,
-                the_workflow_crate,
-                weng_crate=the_weng_crate,
+                sa_crate=the_weng_crate,
+                the_workflow_crate=the_workflow_crate,
             )
-            existing_operational_containers = self._wf_to_operational_containers.get(
-                the_workflow_crate.id, []
+            existing_operational_containers = (
+                self._wf_to_operational_containers.setdefault(the_workflow_crate.id, [])
             )
             for added_operational_container in added_operational_containers:
                 if added_operational_container not in existing_operational_containers:
                     existing_operational_containers.append(added_operational_container)
-            self._wf_to_operational_containers[
-                the_workflow_crate.id
-            ] = existing_operational_containers
 
         if do_attach and (the_uri is not None):
             if the_uri.startswith("http") or the_uri.startswith("ftp"):
@@ -1779,10 +2234,15 @@ class WorkflowRunROCrate:
                 self.crate.add(formal_parameter)
 
             # Add to the list only when it is needed
-            wf_file_outputs = self.wf_file.get("output", [])
+            wf_file_outputs = self.wf_file.get("output")
             if (
-                formal_parameter not in wf_file_outputs
-                and {"@id": formal_parameter_id} not in wf_file_outputs
+                wf_file_outputs is None
+                or formal_parameter != wf_file_outputs
+                or (
+                    isinstance(wf_file_outputs, list)
+                    and formal_parameter not in wf_file_outputs
+                    and {"@id": formal_parameter_id} not in wf_file_outputs
+                )
             ):
                 self.wf_file.append_to("output", formal_parameter, compact=True)
 
@@ -1819,25 +2279,17 @@ class WorkflowRunROCrate:
         if len(self._agents) > 0:
             crate_action.append_to("agent", self._agents, compact=True)
         self.crate.root_dataset.append_to("mentions", crate_action, compact=True)
-        instruments: "MutableSequence[rocrate.model.entity.Entity]" = [
-            self.wf_wfexs,
-            self.wf_file,
-            self.weng_crate,
-        ]
-        # Adding both operational containers
-        if self.wf_file.id in self._wf_to_operational_containers:
-            if self.wf_file.id in self._wf_to_container_sa:
-                instruments.append(self._wf_to_container_sa[self.wf_file.id])
-            instruments.extend(self._wf_to_operational_containers[self.wf_file.id])
-        # and "normal" containers
+
+        # Skipping adding operational containers for now
+        # if self.wf_file.id in self._wf_to_operational_containers:
+        #     for container_image in self._wf_to_operational_containers[self.wf_file.id]:
+        #         crate_action.append_to("containerImage", container_image, compact=True)
+        # Adding "normal" containers
         if self.wf_file.id in self._wf_to_containers:
-            if (
-                self.wf_file.id in self._wf_to_container_sa
-                and self.wf_file.id not in self._wf_to_operational_containers
-            ):
-                instruments.append(self._wf_to_container_sa[self.wf_file.id])
-            instruments.extend(self._wf_to_containers[self.wf_file.id])
-        crate_action.append_to("instrument", instruments, compact=True)
+            for container_image in self._wf_to_containers[self.wf_file.id]:
+                crate_action.append_to("containerImage", container_image, compact=True)
+
+        crate_action.append_to("instrument", self.wf_file, compact=True)
         # subjectOf is not fulfilled as this execution has not public page
         if stagedExec.exitVal == 0:
             action_status = "http://schema.org/CompletedActionStatus"
@@ -1864,7 +2316,130 @@ class WorkflowRunROCrate:
             stagedExec.matCheckOutputs,
             rel_work_dir=stagedExec.outputsDir,
         )
-        crate_action["result"] = crate_outputs
+
+        # Now, the logfiles and diagram
+        crate_meta_outputs: "MutableSequence[rocrate.model.entity.Entity]" = []
+        if stagedExec.diagram is not None:
+            # This is the original diagram, in DOT format (for now)
+            abs_diagram = os.path.join(self.work_dir, stagedExec.diagram)
+            dot_file = WorkflowDiagram(
+                self.crate,
+                source=os.path.join(self.work_dir, stagedExec.diagram),
+                dest_path=stagedExec.diagram,
+                fetch_remote=False,
+                validate_url=False,
+                properties={
+                    "contentSize": str(os.stat(abs_diagram).st_size),
+                    "sha256": ComputeDigestFromFile(
+                        abs_diagram, "sha256", repMethod=hexDigest
+                    ),
+                    "encodingFormat": magic.from_file(abs_diagram, mime=True),
+                },
+            )
+            self.crate.add(dot_file)
+
+            the_diagram = dot_file
+
+            # Declaring the provenance of the diagram
+            dot_file["isBasedOn"] = self.wf_file
+            crate_meta_outputs.append(dot_file)
+
+            png_dot_handle, png_dot_path = tempfile.mkstemp(
+                prefix="WfExS", suffix="diagram", dir=self.tempdir
+            )
+            # Registering for removal the temporary file
+            atexit.register(os.unlink, png_dot_path)
+            # We are not using the handle, so close it
+            os.close(png_dot_handle)
+
+            with tempfile.NamedTemporaryFile() as d_err:
+                dot_cmd = [self.dot_binary, "-Tpng", "-o" + png_dot_path, abs_diagram]
+                dot_cmd_for_rocrate = [
+                    DEFAULT_DOT_CMD,
+                    "-Tpng",
+                    "-o" + stagedExec.diagram + ".png",
+                    stagedExec.diagram,
+                ]
+                d_retval = subprocess.Popen(
+                    dot_cmd,
+                    stdout=d_err,
+                    stderr=d_err,
+                ).wait()
+
+                self.logger.debug(f"'{' '.join(dot_cmd)}' retval: {d_retval}")
+
+                if d_retval == 0:
+                    png_dot_file = WorkflowDiagram(
+                        self.crate,
+                        source=png_dot_path,
+                        dest_path=stagedExec.diagram + ".png",
+                        fetch_remote=False,
+                        validate_url=False,
+                        properties={
+                            "contentSize": str(os.stat(png_dot_path).st_size),
+                            "sha256": ComputeDigestFromFile(
+                                png_dot_path, "sha256", repMethod=hexDigest
+                            ),
+                            "encodingFormat": magic.from_file(png_dot_path, mime=True),
+                        },
+                    )
+                    self.crate.add(png_dot_file)
+                    the_diagram = png_dot_file
+
+                    # Declaring the provenance
+                    png_dot_file["isBasedOn"] = dot_file
+                    crate_meta_outputs.append(png_dot_file)
+
+                    # Now describe the transformation
+                    dot_action = CreateAction(
+                        self.crate,
+                        "Generate diagram PNG image from DOT",
+                    )
+                    dot_action = self.crate.add(dot_action)
+                    dot_action["object"] = dot_file
+                    dot_action["description"] = " ".join(dot_cmd_for_rocrate)
+                    dot_action["result"] = png_dot_file
+                    dot_action.append_to("instrument", self.wf_wfexs, compact=True)
+                    dot_action.append_to(
+                        "actionStatus",
+                        {"@id": "http://schema.org/CompletedActionStatus"},
+                        compact=True,
+                    )
+                    if len(self._agents) > 0:
+                        dot_action.append_to("agent", self._agents, compact=True)
+                else:
+                    # Diagram image generation failed
+                    with open(d_err.name, mode="rb") as c_stF:
+                        d_err_v = c_stF.read().decode("utf-8", errors="continue")
+
+                    self.logger.error(f"'{' '.join(dot_cmd)}' stderr: {d_err_v}")
+
+            # Associating the diagram to the main workflow
+            self.wf_file.append_to("image", the_diagram, compact=True)
+
+        # Processing the log files
+        if len(stagedExec.logfile) > 0:
+            crate_coll: "Union[Collection, FixedFile, None]"
+            if len(stagedExec.logfile) > 1:
+                crate_coll = self._add_collection_to_crate()
+            else:
+                crate_coll = None
+
+            for logfile in stagedExec.logfile:
+                the_log_file = self._add_file_to_crate(
+                    os.path.join(self.work_dir, logfile), the_uri=None, the_name=logfile
+                )
+                if crate_coll is None:
+                    crate_coll = the_log_file
+                else:
+                    crate_coll.append_to("hasPart", the_log_file, compact=True)
+
+            if crate_coll is not None:
+                crate_meta_outputs.append(crate_coll)
+                if stagedExec.exitVal != 0:
+                    crate_action["error"] = crate_coll
+
+        crate_action["result"] = [*crate_outputs, *crate_meta_outputs]
 
         # TODO: Uncomment this when we are able to describe
         # the internal workflow execution. Each workflow step

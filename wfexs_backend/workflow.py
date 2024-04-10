@@ -26,20 +26,24 @@ import logging
 import os
 import pathlib
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import warnings
 
 from typing import (
     cast,
+    NamedTuple,
     Pattern,
     TYPE_CHECKING,
 )
 
 from .common import (
+    ContainerType,
     CratableItem,
     DEFAULT_CONTAINER_TYPE,
     NoCratableItem,
@@ -55,6 +59,7 @@ if TYPE_CHECKING:
         MutableMapping,
         MutableSequence,
         Optional,
+        Pattern,
         Sequence,
         Set,
         Tuple,
@@ -72,7 +77,6 @@ if TYPE_CHECKING:
 
     from .common import (
         AbsPath,
-        AbstractWorkflowEngineType,
         AnyContent,
         AnyPath,
         ContainerEngineVersionStr,
@@ -100,14 +104,18 @@ if TYPE_CHECKING:
         WorkflowConfigBlock,
         WorkflowEngineVersionStr,
         WorkflowMetaConfigBlock,
-        WorkflowType,
         WritableSecurityContextConfig,
         WritableWorkflowMetaConfigBlock,
         URIType,
+        URIWithMetadata,
     )
 
     from .encrypted_fs import (
         EncryptedFSType,
+    )
+
+    from .engine import (
+        AbstractWorkflowEngineType,
     )
 
     Sch_PlainURI = URIType
@@ -160,8 +168,19 @@ if TYPE_CHECKING:
 
 import urllib.parse
 
+# This is needed to assure yaml.safe_load unmarshalls gives no error
+from .container import (
+    Container,
+)
+from .engine import (
+    WorkflowType,
+)
+
 from .ro_crate import (
     WorkflowRunROCrate,
+)
+from .security_context import (
+    SecurityContextVault,
 )
 import bagit
 
@@ -179,6 +198,10 @@ try:
 except ImportError:
     from yaml import Loader as YAMLLoader, Dumper as YAMLDumper
 
+# This is needed to keep backward compatibility
+# with ancient working directories
+Container.RegisterYAMLConstructor(YAMLLoader)
+
 from .common import (
     AbstractWfExSException,
     Attribution,
@@ -186,9 +209,7 @@ from .common import (
     ContentKind,
     DefaultNoLicenceTuple,
     ExpectedOutput,
-    ExportItem,
     ExportItemType,
-    ExportAction,
     GeneratedContent,
     GeneratedDirectoryContent,
     LicensedURI,
@@ -196,8 +217,6 @@ from .common import (
     MarshallingStatus,
     MaterializedContent,
     MaterializedInput,
-    MaterializedExportAction,
-    MaterializedWorkflowEngine,
     RemoteRepo,
     StagedSetup,
 )
@@ -205,6 +224,8 @@ from .common import (
 from .encrypted_fs import ENCRYPTED_FS_MOUNT_IMPLEMENTATIONS
 
 from .engine import (
+    MaterializedWorkflowEngine,
+    STATS_DAG_DOT_FILE,
     WorkflowEngine,
     WorkflowEngineException,
     WORKDIR_CONSOLIDATED_WORKFLOW_RELDIR,
@@ -219,6 +240,9 @@ from .engine import (
     WORKDIR_META_RELDIR,
     WORKDIR_OUTPUTS_RELDIR,
     WORKDIR_PASSPHRASE_FILE,
+    WORKDIR_STATS_RELDIR,
+    WORKDIR_STDERR_FILE,
+    WORKDIR_STDOUT_FILE,
     WORKDIR_WORKFLOW_META_FILE,
     WORKDIR_WORKFLOW_RELDIR,
 )
@@ -241,6 +265,40 @@ from .snakemake_engine import SnakemakeWorkflowEngine
 
 if TYPE_CHECKING:
     from .wfexs_backend import WfExSBackend
+
+
+# Related export namedtuples
+class ExportItem(NamedTuple):
+    type: "ExportItemType"
+    block: "Optional[str]" = None
+    name: "Optional[Union[SymbolicParamName, SymbolicOutputName]]" = None
+
+
+# The description of an export action
+class ExportAction(NamedTuple):
+    action_id: "SymbolicName"
+    plugin_id: "SymbolicName"
+    what: "Sequence[ExportItem]"
+    context_name: "Optional[SymbolicName]"
+    setup: "Optional[SecurityContextConfig]"
+    preferred_scheme: "Optional[str]"
+    preferred_id: "Optional[str]"
+    licences: "Sequence[str]" = []
+
+
+class MaterializedExportAction(NamedTuple):
+    """
+    The description of an export action which was materialized, so
+    a permanent identifier was obtained, along with some metadata
+    """
+
+    action: "ExportAction"
+    elems: "Sequence[AnyContent]"
+    pids: "Sequence[URIWithMetadata]"
+    when: "datetime.datetime" = datetime.datetime.now(
+        tz=datetime.timezone.utc
+    ).astimezone()
+
 
 # The list of classes to be taken into account
 # CWL detection is before, as Nextflow one is
@@ -283,7 +341,6 @@ class WF:
 
     TRS_TOOL_FILES_FILE: "Final[RelPath]" = cast("RelPath", "trs_tool_files.json")
 
-    SECURITY_CONTEXT_SCHEMA: "Final[RelPath]" = cast("RelPath", "security-context.json")
     STAGE_DEFINITION_SCHEMA: "Final[RelPath]" = cast("RelPath", "stage-definition.json")
     EXPORT_ACTIONS_SCHEMA: "Final[RelPath]" = cast("RelPath", "export-actions.json")
 
@@ -316,7 +373,7 @@ class WF:
         placeholders: "Optional[PlaceHoldersBlock]" = None,
         default_actions: "Optional[Sequence[ExportActionBlock]]" = None,
         workflow_config: "Optional[WorkflowConfigBlock]" = None,
-        creds_config: "Optional[SecurityContextConfigBlock]" = None,
+        vault: "Optional[SecurityContextVault]" = None,
         instanceId: "Optional[WfExSInstanceId]" = None,
         nickname: "Optional[str]" = None,
         orcids: "Sequence[str]" = [],
@@ -343,7 +400,7 @@ class WF:
         :param params: Optional params for the workflow execution.
         :param outputs:
         :param workflow_config: Tweaks for workflow enactment, like some overrides
-        :param creds_config: Dictionary with the different credential contexts, only used to fetch fresh contents
+        :param vault: Dictionary with the different credential contexts, only used to fetch fresh contents
         :param instanceId: The instance id of this working directory
         :param nickname: The nickname of this working directory
         :param creation: The creation timestamp
@@ -357,7 +414,7 @@ class WF:
         :type params: dict
         :type outputs: dict
         :type workflow_config: dict
-        :type creds_config: SecurityContextConfigBlock
+        :type vault: SecurityContextVault
         :type instanceId: str
         :type creation datetime.datetime
         :type rawWorkDir: str
@@ -384,12 +441,21 @@ class WF:
             self.paranoidMode = self.wfexs.getDefaultParanoidMode()
 
         if not isinstance(workflow_config, dict):
-            workflow_config = {}
+            workflow_config = dict()
 
-        if workflow_config.get("containerType") is None:
-            workflow_config["containerType"] = self.wfexs.local_config.get(
-                "tools", {}
-            ).get("containerType", DEFAULT_CONTAINER_TYPE.value)
+        # The container type first is looked up at the workflow configuration
+        # and later at the local configuration
+        container_type_str = workflow_config.get("containerType")
+        if container_type_str is None:
+            self.explicit_container_type = False
+            container_type_str = self.wfexs.local_config.get("tools", dict()).get(
+                "containerType", DEFAULT_CONTAINER_TYPE.value
+            )
+            workflow_config["containerType"] = container_type_str
+        else:
+            self.explicit_container_type = True
+        # This property should mutate after unmarshalling the config
+        self.container_type_str = container_type_str
 
         self.outputs: "Optional[Sequence[ExpectedOutput]]"
         self.default_actions: "Optional[Sequence[ExportAction]]"
@@ -428,27 +494,23 @@ class WF:
                 self.logger.error(errstr)
                 raise WFException(errstr)
 
-            if not isinstance(creds_config, dict):
-                creds_config = {}
-
-            valErrors = config_validate(creds_config, self.SECURITY_CONTEXT_SCHEMA)
-            if len(valErrors) > 0:
-                errstr = f"ERROR in security context block: {valErrors}"
-                self.logger.error(errstr)
-                raise WFException(errstr)
+            # Processing the input creds_config
+            if not isinstance(vault, SecurityContextVault):
+                vault = SecurityContextVault()
 
             if not isinstance(params, dict):
-                params = {}
+                params = dict()
 
             if not isinstance(outputs, dict):
-                outputs = {}
+                outputs = dict()
 
             if not isinstance(placeholders, dict):
-                placeholders = {}
+                placeholders = dict()
 
             # Workflow-specific
             self.workflow_config = workflow_config
-            self.creds_config = creds_config
+
+            self.vault = vault
 
             self.id = str(workflow_id) if workflow_id is not None else None
             self.version_id = str(version_id) if version_id is not None else None
@@ -642,6 +704,18 @@ class WF:
                         self.workflow_config = None
                         # self.marshallConfig(overwrite=False)
             else:
+                # This check has to be done before the marshalling of the config
+                # in order to avoid very ill stage directories
+                try:
+                    container_type = ContainerType(self.container_type_str)
+                except ValueError as ve:
+                    errstr = f"Unable to initialize, {self.container_type_str} (explicitly set: {'yes' if self.explicit_container_type else 'no'}) is not a valid container type"
+                    self.logger.error(errstr)
+                    raise WFException(errstr) from ve
+                # As it is a new deployment, forget the concern about
+                # the container type
+                self.explicit_container_type = True
+
                 os.makedirs(self.metaDir, exist_ok=True)
                 self.marshallConfig(overwrite=True)
                 is_damaged = False
@@ -658,8 +732,19 @@ class WF:
             self.consolidatedWorkflowDir = None
             self.containersDir = None
 
+        # Now it is the moment to check. It could happen that the
+        # working directory comes from a version where a new container
+        # type is supported, but not in this one
+        try:
+            container_type = ContainerType(self.container_type_str)
+        except ValueError as ve:
+            errstr = f"Unable to initialize, {self.container_type_str} (explicitly set: {'yes' if self.explicit_container_type else 'no'}) is not a valid container type"
+            self.logger.error(errstr)
+            raise WFException(errstr) from ve
+
         self.stagedSetup = StagedSetup(
             instance_id=self.instanceId,
+            container_type=container_type,
             nickname=self.nickname,
             creation=self.workdir_creation,
             workflow_config=self.workflow_config,
@@ -1040,15 +1125,6 @@ class WF:
         )
 
     @classmethod
-    def ReadSecurityContextFile(
-        cls, securityContextsConfigFilename: "AnyPath"
-    ) -> "SecurityContextConfigBlock":
-        with open(securityContextsConfigFilename, mode="r", encoding="utf-8") as scf:
-            creds_config = unmarshall_namedtuple(yaml.safe_load(scf))
-
-        return cast("SecurityContextConfigBlock", creds_config)
-
-    @classmethod
     def FromFiles(
         cls,
         wfexs: "WfExSBackend",
@@ -1068,6 +1144,35 @@ class WF:
         with open(workflowMetaFilename, mode="r", encoding="utf-8") as wcf:
             workflow_meta = unmarshall_namedtuple(yaml.safe_load(wcf))
 
+        return cls.FromStagedRecipe(
+            wfexs,
+            workflow_meta,
+            securityContextsConfigFilename=securityContextsConfigFilename,
+            nickname_prefix=nickname_prefix,
+            orcids=orcids,
+            public_key_filenames=public_key_filenames,
+            private_key_filename=private_key_filename,
+            private_key_passphrase=private_key_passphrase,
+            paranoidMode=paranoidMode,
+        )
+
+    @classmethod
+    def FromStagedRecipe(
+        cls,
+        wfexs: "WfExSBackend",
+        workflow_meta: "WritableWorkflowMetaConfigBlock",
+        securityContextsConfigFilename: "Optional[AnyPath]" = None,
+        nickname_prefix: "Optional[str]" = None,
+        orcids: "Sequence[str]" = [],
+        public_key_filenames: "Sequence[AnyPath]" = [],
+        private_key_filename: "Optional[AnyPath]" = None,
+        private_key_passphrase: "Optional[str]" = None,
+        paranoidMode: "bool" = False,
+    ) -> "WF":
+        """
+        This class method creates a new staged working directory
+        """
+
         # Should we prepend the nickname prefix?
         if nickname_prefix is not None:
             workflow_meta["nickname"] = nickname_prefix + workflow_meta.get(
@@ -1077,20 +1182,18 @@ class WF:
         # Last, try loading the security contexts credentials file
         if securityContextsConfigFilename:
             if os.path.exists(securityContextsConfigFilename):
-                creds_config = cls.ReadSecurityContextFile(
-                    securityContextsConfigFilename
-                )
+                vault = SecurityContextVault.FromFile(securityContextsConfigFilename)
             else:
                 raise WFException(
                     f"Security context file {securityContextsConfigFilename} is not reachable"
                 )
         else:
-            creds_config = {}
+            vault = SecurityContextVault()
 
         return cls.FromDescription(
             wfexs,
             workflow_meta,
-            creds_config,
+            vault,
             paranoidMode=paranoidMode,
             orcids=orcids,
             public_key_filenames=public_key_filenames,
@@ -1099,11 +1202,53 @@ class WF:
         )
 
     @classmethod
+    def FromPreviousInstanceDeclaration(
+        cls,
+        wfexs: "WfExSBackend",
+        wfInstance: "WF",
+        securityContextsConfigFilename: "Optional[AnyPath]" = None,
+        nickname_prefix: "Optional[str]" = None,
+        orcids: "Sequence[str]" = [],
+        public_key_filenames: "Sequence[AnyPath]" = [],
+        private_key_filename: "Optional[AnyPath]" = None,
+        private_key_passphrase: "Optional[str]" = None,
+        paranoidMode: "bool" = False,
+    ) -> "WF":
+        """
+        This class method creates a new staged working directory
+        based on the declaration of an existing one
+        """
+
+        # The workflow information can be incomplete without this step.
+        # was_staged = wfInstance.unmarshallStage(offline=True, fail_ok=True, do_full_setup=False)
+        # if not isinstance(was_staged, datetime.datetime):
+        #    raise WFException(f"Staged working directory from {wfInstance} was not properly staged")
+        # Now we should be able to get the configuration file
+        workflow_meta = copy.deepcopy(wfInstance.staging_recipe)
+
+        # We have to reset the inherited paranoid mode and nickname
+        for k_name in ("nickname", "paranoid_mode"):
+            if k_name in workflow_meta:
+                del workflow_meta[k_name]
+
+        return cls.FromStagedRecipe(
+            wfexs,
+            workflow_meta,
+            securityContextsConfigFilename=securityContextsConfigFilename,
+            nickname_prefix=nickname_prefix,
+            orcids=orcids,
+            public_key_filenames=public_key_filenames,
+            private_key_filename=private_key_filename,
+            private_key_passphrase=private_key_passphrase,
+            paranoidMode=paranoidMode,
+        )
+
+    @classmethod
     def FromDescription(
         cls,
         wfexs: "WfExSBackend",
         workflow_meta: "WorkflowMetaConfigBlock",
-        creds_config: "Optional[SecurityContextConfigBlock]" = None,
+        vault: "SecurityContextVault",
         orcids: "Sequence[str]" = [],
         public_key_filenames: "Sequence[AnyPath]" = [],
         private_key_filename: "Optional[AnyPath]" = None,
@@ -1116,11 +1261,9 @@ class WF:
         :param wfexs: WfExSBackend instance
         :param workflow_meta: The configuration describing both the workflow
         and the inputs to use when it is being instantiated.
-        :param creds_config: Dictionary with the different credential contexts (to be implemented)
         :param paranoidMode:
         :type wfexs: WfExSBackend
         :type workflow_meta: dict
-        :type creds_config: SecurityContextConfigBlock
         :type paranoidMode: bool
         :return: Workflow configuration
         """
@@ -1136,15 +1279,15 @@ class WF:
             workflow_meta.get("version"),
             descriptor_type=workflow_meta.get("workflow_type"),
             trs_endpoint=workflow_meta.get("trs_endpoint", cls.DEFAULT_TRS_ENDPOINT),
-            params=workflow_meta.get("params", {}),
-            environment=workflow_meta.get("environment", {}),
-            outputs=workflow_meta.get("outputs", {}),
-            placeholders=workflow_meta.get("placeholders", {}),
+            params=workflow_meta.get("params", dict()),
+            environment=workflow_meta.get("environment", dict()),
+            outputs=workflow_meta.get("outputs", dict()),
+            placeholders=workflow_meta.get("placeholders", dict()),
             default_actions=workflow_meta.get("default_actions"),
             workflow_config=workflow_meta.get("workflow_config"),
             nickname=workflow_meta.get("nickname"),
             orcids=orcids,
-            creds_config=creds_config,
+            vault=vault,
             public_key_filenames=public_key_filenames,
             private_key_filename=private_key_filename,
             private_key_passphrase=private_key_passphrase,
@@ -1179,9 +1322,9 @@ class WF:
             workflow_meta.get("version"),
             descriptor_type=workflow_meta.get("workflow_type"),
             trs_endpoint=workflow_meta.get("trs_endpoint", cls.DEFAULT_TRS_ENDPOINT),
-            params=workflow_meta.get("params", {}),
-            environment=workflow_meta.get("environment", {}),
-            placeholders=workflow_meta.get("placeholders", {}),
+            params=workflow_meta.get("params", dict()),
+            environment=workflow_meta.get("environment", dict()),
+            placeholders=workflow_meta.get("placeholders", dict()),
             default_actions=workflow_meta.get("default_actions"),
             workflow_config=workflow_meta.get("workflow_config"),
             nickname=workflow_meta.get("nickname"),
@@ -1394,6 +1537,7 @@ class WF:
                 offline=offline,
             )
 
+    # DEPRECATED?
     def injectInputs(
         self,
         paths: "Sequence[AnyPath]",
@@ -1401,6 +1545,9 @@ class WF:
         workflowInputs_cacheDir: "Optional[Union[AbsPath, CacheType]]" = None,
         lastInput: "int" = 0,
     ) -> int:
+        warnings.warn(
+            "injectInputs is being deprecated", PendingDeprecationWarning, stacklevel=2
+        )
         if workflowInputs_destdir is None:
             workflowInputs_destdir = self.inputsDir
         if workflowInputs_cacheDir is None:
@@ -1423,7 +1570,10 @@ class WF:
                 ("file", "", os.path.abspath(path), "", "", "")
             )
             matContent = self.wfexs.downloadContent(
-                cast("URIType", fileuri),
+                LicensedURI(
+                    uri=cast("URIType", fileuri),
+                ),
+                vault=self.vault,
                 dest=storeDir,
                 ignoreCache=not cacheable,
                 registerInCache=cacheable,
@@ -1473,7 +1623,7 @@ class WF:
             self.extrapolatedInputsDir is not None
         ), "The working directory should not be corrupted beyond basic usage"
 
-        theParams, numInputs = self.fetchInputs(
+        theParams, numInputs, the_failed_uris = self.fetchInputs(
             formatted_params,
             workflowInputs_destdir=self.inputsDir,
             workflowExtrapolatedInputs_destdir=self.extrapolatedInputsDir,
@@ -1482,45 +1632,43 @@ class WF:
             lastInput=lastInput,
         )
 
+        if len(the_failed_uris) > 0:
+            self.logger.error(
+                "Next URIs could not be downloaded. Maybe some kind of authentication is needed."
+            )
+            for failed_uri in the_failed_uris:
+                self.logger.error(f"-> {failed_uri}")
+
+            raise WFException(
+                f"{len(the_failed_uris)} URIs could not be fetched. See log for details"
+            )
+
         return theParams
 
-    def getContext(
-        self, remote_file: "str", contextName: "Optional[str]"
-    ) -> "Optional[SecurityContextConfig]":
-        secContext = None
-        if contextName is not None:
-            secContext = self.creds_config.get(contextName)
-            if secContext is None:
-                raise WFException(
-                    "No security context {} is available, needed by {}".format(
-                        contextName, remote_file
-                    )
-                )
-
-        return secContext
-
-    def buildLicensedURI(
+    def _buildLicensedURI(
         self,
         remote_file_f: "Sch_InputURI_Fetchable",
         contextName: "Optional[str]" = None,
         licences: "Tuple[URIType, ...]" = DefaultNoLicenceTuple,
         attributions: "Sequence[Attribution]" = [],
-    ) -> "Union[LicensedURI, Sequence[LicensedURI]]":
+    ) -> "Tuple[Union[LicensedURI, Sequence[LicensedURI]], bool]":
+        was_simple = False
         if isinstance(remote_file_f, list):
             retvals = []
             for remote_url in remote_file_f:
-                retval = self.buildLicensedURI(
+                retval, this_was_simple = self._buildLicensedURI(
                     remote_url,
                     contextName=contextName,
                     licences=licences,
                     attributions=attributions,
                 )
+                was_simple |= this_was_simple
                 if isinstance(retval, list):
                     retvals.extend(retval)
                 else:
                     retvals.append(retval)
 
-            return retvals
+            return retvals, was_simple
 
         if isinstance(remote_file_f, dict):
             remote_file = remote_file_f
@@ -1540,23 +1688,19 @@ class WF:
             if len(parsed_attributions) > 0:
                 attributions = parsed_attributions
         else:
+            was_simple = True
             remote_url = remote_file_f
 
-        secContext = None
-        if contextName is not None:
-            secContext = self.creds_config.get(contextName)
-            if secContext is None:
-                raise WFException(
-                    "No security context {} is available, needed by {}".format(
-                        contextName, remote_file_f
-                    )
-                )
+        secContext = self.vault.getContext(remote_url, contextName)
 
-        return LicensedURI(
-            uri=remote_url,
-            licences=licences,
-            attributions=attributions,
-            secContext=secContext,
+        return (
+            LicensedURI(
+                uri=remote_url,
+                licences=licences,
+                attributions=attributions,
+                secContext=secContext,
+            ),
+            was_simple,
         )
 
     def _fetchRemoteFile(
@@ -1574,13 +1718,19 @@ class WF:
         ignoreCache: "bool" = False,
     ) -> "Sequence[MaterializedContent]":
         # Embedding the context
-        alt_remote_file = self.buildLicensedURI(remote_file, contextName=contextName)
+        alt_remote_file, alt_is_plain = self._buildLicensedURI(
+            remote_file, contextName=contextName
+        )
+        # Trying to preserve what it is returned by the cache
+        # unless we are explicitly feeding a licence
         matContent = self.wfexs.downloadContent(
             alt_remote_file,
             dest=storeDir,
             offline=offline,
+            vault=self.vault,
             ignoreCache=ignoreCache or not cacheable,
             registerInCache=cacheable,
+            keep_cache_licence=alt_is_plain,
         )
 
         # Now, time to create the link
@@ -1654,6 +1804,8 @@ class WF:
                         kind=ContentKind.Directory
                         if exp.is_dir()
                         else ContentKind.File,
+                        # Lazy evaluation of fingerprint,
+                        # so do not compute it here
                     )
                 )
         else:
@@ -1663,14 +1815,13 @@ class WF:
                 prettyFilename=prettyRelname,
                 kind=matContent.kind,
                 metadata_array=matContent.metadata_array,
+                fingerprint=matContent.fingerprint,
             )
             remote_pairs.append(remote_pair)
 
         return remote_pairs
 
     def _formatStringFromPlaceHolders(self, the_string: "str") -> "str":
-        assert self.placeholders is not None
-
         i_l_the_string = the_string.find("{")
         i_r_the_string = the_string.find("}")
         if (
@@ -1940,7 +2091,7 @@ class WF:
         lastInput: "int" = 0,
         offline: "bool" = False,
         ignoreCache: "bool" = False,
-    ) -> "Tuple[Sequence[MaterializedInput], int]":
+    ) -> "Tuple[Sequence[MaterializedInput], int, Sequence[str]]":
         tabconf = inputs.get("tabular")
         if not isinstance(tabconf, dict):
             raise WFException(
@@ -2035,20 +2186,27 @@ class WF:
 
         # Fetch and process the files with the URIs to be processed
         theNewInputs: "MutableSequence[MaterializedInput]" = []
+        the_failed_uris: "MutableSequence[str]" = []
         for remote_file in remote_files_f:
             lastInput += 1
-            t_remote_pairs = self._fetchRemoteFile(
-                remote_file,
-                contextName,
-                offline,
-                storeDir,
-                cacheable,
-                inputDestDir,
-                globExplode=None,
-                prefix=str(lastInput) + "_",
-                prettyRelname=pretty_relname,
-                ignoreCache=this_ignoreCache,
-            )
+            try:
+                t_remote_pairs = self._fetchRemoteFile(
+                    remote_file,
+                    contextName,
+                    offline,
+                    storeDir,
+                    cacheable,
+                    inputDestDir,
+                    globExplode=None,
+                    prefix=str(lastInput) + "_",
+                    prettyRelname=pretty_relname,
+                    ignoreCache=this_ignoreCache,
+                )
+            except:
+                self.logger.exception(
+                    f"Error while fetching primary content with URIs {remote_file}"
+                )
+                the_failed_uris.append(remote_file)
 
             # Time to process each file
             these_secondary_uris: "Set[str]" = set()
@@ -2078,23 +2236,29 @@ class WF:
 
             secondary_remote_pairs: "Optional[MutableSequence[MaterializedContent]]"
             if len(these_secondary_uris) > 0:
-                secondary_uri_mapping: "MutableMapping[str, str]" = {}
+                secondary_uri_mapping: "MutableMapping[str, str]" = dict()
                 secondary_remote_pairs = []
                 # Fetch each gathered URI
                 for secondary_remote_file in these_secondary_uris:
                     # The last fetched content prefix is the one used
                     # for all the secondaries
-                    t_secondary_remote_pairs = self._fetchRemoteFile(
-                        cast("URIType", secondary_remote_file),
-                        contextName,
-                        offline,
-                        storeDir,
-                        cacheable,
-                        inputDestDir,
-                        globExplode=None,
-                        prefix=str(lastInput) + "_",
-                        ignoreCache=ignoreCache,
-                    )
+                    try:
+                        t_secondary_remote_pairs = self._fetchRemoteFile(
+                            cast("URIType", secondary_remote_file),
+                            contextName,
+                            offline,
+                            storeDir,
+                            cacheable,
+                            inputDestDir,
+                            globExplode=None,
+                            prefix=str(lastInput) + "_",
+                            ignoreCache=ignoreCache,
+                        )
+                    except:
+                        self.logger.exception(
+                            f"Error while fetching secondary content with URIs {secondary_remote_file}"
+                        )
+                        the_failed_uris.append(secondary_remote_file)
 
                     # Rescuing the correspondence to be used later
                     for t_secondary_remote_pair in t_secondary_remote_pairs:
@@ -2171,7 +2335,7 @@ class WF:
                 )
             )
 
-        return theNewInputs, lastInput
+        return theNewInputs, lastInput, the_failed_uris
 
     def fetchInputs(
         self,
@@ -2182,7 +2346,7 @@ class WF:
         lastInput: "int" = 0,
         offline: "bool" = False,
         ignoreCache: "bool" = False,
-    ) -> "Tuple[Sequence[MaterializedInput], int]":
+    ) -> "Tuple[Sequence[MaterializedInput], int, Sequence[str]]":
         """
         Fetch the input files for the workflow execution.
         All the inputs must be URLs or CURIEs from identifiers.org / n2t.net.
@@ -2201,6 +2365,8 @@ class WF:
         ), "Working directory should not be corrupted beyond basic usage"
 
         theInputs = []
+
+        the_failed_uris: "MutableSequence[str]" = []
 
         paramsIter = params.items() if isinstance(params, dict) else enumerate(params)
         for key, inputs in paramsIter:
@@ -2351,19 +2517,25 @@ class WF:
                             remote_pairs: "MutableSequence[MaterializedContent]" = []
                             for remote_file in remote_files_f:
                                 lastInput += 1
-                                t_remote_pairs = self._fetchRemoteFile(
-                                    remote_file,
-                                    contextName,
-                                    offline,
-                                    storeDir,
-                                    cacheable,
-                                    inputDestDir,
-                                    globExplode,
-                                    prefix=str(lastInput) + "_",
-                                    prettyRelname=pretty_relname,
-                                    ignoreCache=this_ignoreCache,
-                                )
-                                remote_pairs.extend(t_remote_pairs)
+                                try:
+                                    t_remote_pairs = self._fetchRemoteFile(
+                                        remote_file,
+                                        contextName,
+                                        offline,
+                                        storeDir,
+                                        cacheable,
+                                        inputDestDir,
+                                        globExplode,
+                                        prefix=str(lastInput) + "_",
+                                        prettyRelname=pretty_relname,
+                                        ignoreCache=this_ignoreCache,
+                                    )
+                                    remote_pairs.extend(t_remote_pairs)
+                                except:
+                                    self.logger.exception(
+                                        f"Error while fetching primary URI {remote_file}"
+                                    )
+                                    the_failed_uris.append(remote_file)
 
                             secondary_remote_pairs: "Optional[MutableSequence[MaterializedContent]]"
                             if (remote_files is not None) and (
@@ -2386,20 +2558,29 @@ class WF:
                                 for secondary_remote_file in secondary_remote_files_f:
                                     # The last fetched content prefix is the one used
                                     # for all the secondaries
-                                    t_secondary_remote_pairs = self._fetchRemoteFile(
-                                        secondary_remote_file,
-                                        contextName,
-                                        offline,
-                                        storeDir,
-                                        cacheable,
-                                        inputDestDir,
-                                        globExplode,
-                                        prefix=str(lastInput) + "_",
-                                        ignoreCache=ignoreCache,
-                                    )
-                                    secondary_remote_pairs.extend(
-                                        t_secondary_remote_pairs
-                                    )
+                                    try:
+                                        t_secondary_remote_pairs = (
+                                            self._fetchRemoteFile(
+                                                secondary_remote_file,
+                                                contextName,
+                                                offline,
+                                                storeDir,
+                                                cacheable,
+                                                inputDestDir,
+                                                globExplode,
+                                                prefix=str(lastInput) + "_",
+                                                ignoreCache=ignoreCache,
+                                            )
+                                        )
+                                        secondary_remote_pairs.extend(
+                                            t_secondary_remote_pairs
+                                        )
+                                    except:
+                                        self.logger.exception(
+                                            f"Error while fetching secondary URI {secondary_remote_file}"
+                                        )
+                                        the_failed_uris.append(secondary_remote_file)
+
                             else:
                                 secondary_remote_pairs = None
 
@@ -2448,7 +2629,11 @@ class WF:
                             )
 
                     elif inputClass == ContentKind.ContentWithURIs.name:
-                        theNewInputs, lastInput = self._fetchContentWithURIs(
+                        (
+                            theNewInputs,
+                            lastInput,
+                            new_failed_uris,
+                        ) = self._fetchContentWithURIs(
                             inputs,
                             linearKey,
                             workflowInputs_destdir,
@@ -2458,6 +2643,7 @@ class WF:
                             ignoreCache=ignoreCache,
                         )
                         theInputs.extend(theNewInputs)
+                        the_failed_uris.extend(new_failed_uris)
                     elif inputClass == ContentKind.Value.name:
                         input_val = inputs.get("value")
                         if input_val is None:
@@ -2479,7 +2665,7 @@ class WF:
                         )
                 else:
                     # possible nested files
-                    newInputsAndParams, lastInput = self.fetchInputs(
+                    newInputsAndParams, lastInput, new_failed_uris = self.fetchInputs(
                         inputs,
                         workflowInputs_destdir=workflowInputs_destdir,
                         workflowExtrapolatedInputs_destdir=workflowExtrapolatedInputs_destdir,
@@ -2489,6 +2675,7 @@ class WF:
                         ignoreCache=ignoreCache,
                     )
                     theInputs.extend(newInputsAndParams)
+                    the_failed_uris.extend(new_failed_uris)
             else:
                 if not isinstance(inputs, list):
                     inputs = [inputs]
@@ -2499,7 +2686,7 @@ class WF:
                     )
                 )
 
-        return theInputs, lastInput
+        return theInputs, lastInput, the_failed_uris
 
     def stageWorkDir(
         self, offline: "bool" = False, ignoreCache: "bool" = False
@@ -2721,22 +2908,16 @@ class WF:
             actions = None
 
         if securityContextFile is not None:
-            creds_config = self.ReadSecurityContextFile(securityContextFile)
-
-            valErrors = config_validate(creds_config, self.SECURITY_CONTEXT_SCHEMA)
-            if len(valErrors) > 0:
-                errstr = f"ERROR in security context block: {valErrors}"
-                self.logger.error(errstr)
-                raise WFException(errstr)
+            vault = SecurityContextVault.FromFile(securityContextFile)
         else:
-            creds_config = None
+            vault = SecurityContextVault()
 
-        return self.exportResults(actions, creds_config, action_ids, fail_ok=fail_ok)
+        return self.exportResults(actions, vault, action_ids, fail_ok=fail_ok)
 
     def exportResults(
         self,
         actions: "Optional[Sequence[ExportAction]]" = None,
-        creds_config: "Optional[SecurityContextConfigBlock]" = None,
+        vault: "Optional[SecurityContextVault]" = None,
         action_ids: "Sequence[SymbolicName]" = [],
         fail_ok: "bool" = False,
         op_licences: "Sequence[str]" = [],
@@ -2779,9 +2960,6 @@ class WF:
                 for op_orcid in op_orcids:
                     if op_orcid not in the_orcids:
                         the_orcids.append(op_orcid)
-                elems = self.locateExportItems(
-                    action.what, licences=the_licences, orcids=the_orcids
-                )
 
                 # check the security context is available
                 a_setup_block: "Optional[WritableSecurityContextConfig]"
@@ -2795,8 +2973,9 @@ class WF:
 
                 if action.context_name is None:
                     pass
-                elif creds_config is not None:
-                    setup_block = creds_config.get(action.context_name)
+                elif vault is not None:
+                    # TODO: rework this
+                    setup_block = vault.getContext("", action.context_name)
                     if setup_block is None:
                         raise ExportActionException(
                             f"No configuration found for context {action.context_name} (action {action.action_id})"
@@ -2814,19 +2993,33 @@ class WF:
                     )
 
                 # check whether plugin is available
+                # TODO: Should we include mechanism to reuse a PID
+                # already used in a previous export?
                 export_p = self.wfexs.instantiateExportPlugin(
                     self,
                     action.plugin_id,
                     sec_context=a_setup_block,
                     licences=the_licences,
                     orcids=the_orcids,
+                    preferred_id=action.preferred_id,
+                )
+
+                # This booked pid could differ from the preferred one
+                # as it could not be reused due some constraints
+                booked_pid = export_p.book_pid()
+
+                elems = self.locateExportItems(
+                    action.what,
+                    licences=the_licences,
+                    orcids=the_orcids,
+                    crate_pid=booked_pid,
                 )
 
                 # Export the contents and obtain a PID
                 new_pids = export_p.push(
                     elems,
                     preferred_scheme=action.preferred_scheme,
-                    preferred_id=action.preferred_id,
+                    preferred_id=booked_pid,
                 )
 
                 # Last, register the PID
@@ -2862,6 +3055,38 @@ class WF:
 
         return matActions, actionErrors
 
+    @property
+    def staging_recipe(self) -> "WritableWorkflowMetaConfigBlock":
+        workflow_meta: "WritableWorkflowMetaConfigBlock" = {
+            "workflow_id": self.id,
+            "paranoid_mode": self.paranoidMode,
+        }
+        if self.nickname is not None:
+            workflow_meta["nickname"] = self.nickname
+        if self.version_id is not None:
+            workflow_meta["version"] = self.version_id
+        if self.descriptor_type is not None:
+            workflow_meta["workflow_type"] = self.descriptor_type
+        if self.trs_endpoint is not None:
+            workflow_meta["trs_endpoint"] = self.trs_endpoint
+        if self.workflow_config is not None:
+            workflow_meta["workflow_config"] = self.workflow_config
+        if self.params is not None:
+            workflow_meta["params"] = self.params
+        if self.environment is not None:
+            workflow_meta["environment"] = self.environment
+        if self.placeholders is not None:
+            workflow_meta["placeholders"] = self.placeholders
+        if self.outputs is not None:
+            outputs = {output.name: output for output in self.outputs}
+            workflow_meta["outputs"] = outputs
+        if self.default_actions is not None:
+            workflow_meta["default_actions"] = self.default_actions
+
+        return cast(
+            "WritableWorkflowMetaConfigBlock", marshall_namedtuple(workflow_meta)
+        )
+
     def marshallConfig(
         self, overwrite: "bool" = False
     ) -> "Union[bool, datetime.datetime]":
@@ -2880,43 +3105,9 @@ class WF:
                 or not os.path.exists(workflow_meta_filename)
                 or os.path.getsize(workflow_meta_filename) == 0
             ):
+                staging_recipe = self.staging_recipe
                 with open(workflow_meta_filename, mode="w", encoding="utf-8") as wmF:
-                    workflow_meta: "MutableMapping[str, Any]" = {
-                        "workflow_id": self.id,
-                        "paranoid_mode": self.paranoidMode,
-                    }
-                    if self.nickname is not None:
-                        workflow_meta["nickname"] = self.nickname
-                    if self.version_id is not None:
-                        workflow_meta["version"] = self.version_id
-                    if self.descriptor_type is not None:
-                        workflow_meta["workflow_type"] = self.descriptor_type
-                    if self.trs_endpoint is not None:
-                        workflow_meta["trs_endpoint"] = self.trs_endpoint
-                    if self.workflow_config is not None:
-                        workflow_meta["workflow_config"] = self.workflow_config
-                    if self.params is not None:
-                        workflow_meta["params"] = self.params
-                    if self.environment is not None:
-                        workflow_meta["environment"] = self.environment
-                    if self.placeholders is not None:
-                        workflow_meta["placeholders"] = self.placeholders
-                    if self.outputs is not None:
-                        outputs = {output.name: output for output in self.outputs}
-                        workflow_meta["outputs"] = outputs
-                    if self.default_actions is not None:
-                        workflow_meta["default_actions"] = self.default_actions
-
-                    yaml.dump(
-                        marshall_namedtuple(workflow_meta), wmF, Dumper=YAMLDumper
-                    )
-
-            # This has been commented-out, as credentials should NEVER be kept!!!
-            #
-            # creds_file = os.path.join(self.metaDir, WORKDIR_SECURITY_CONTEXT_FILE)
-            # if overwrite or not os.path.exists(creds_file):
-            #     with open(creds_file, mode='w', encoding='utf-8') as crF:
-            #         yaml.dump(marshall_namedtuple(self.creds_config), crF, Dumper=YAMLDumper)
+                    yaml.dump(staging_recipe, wmF, Dumper=YAMLDumper)
 
             self.configMarshalled = datetime.datetime.fromtimestamp(
                 os.path.getctime(workflow_meta_filename), tz=datetime.timezone.utc
@@ -2937,9 +3128,12 @@ class WF:
                 self.metaDir, WORKDIR_WORKFLOW_META_FILE
             )
             # If the file does not exist, fail fast
-            if not os.path.isfile(workflow_meta_filename):
+            if (
+                not os.path.isfile(workflow_meta_filename)
+                or os.stat(workflow_meta_filename).st_size == 0
+            ):
                 self.logger.debug(
-                    f"Marshalled config file {workflow_meta_filename} does not exist"
+                    f"Marshalled config file {workflow_meta_filename} does not exist or is empty"
                 )
                 return False
 
@@ -2974,6 +3168,13 @@ class WF:
                     self.formatted_params = self.formatParams(self.params)
                     self.formatted_environment = self.formatParams(self.environment)
 
+                    # The right moment to rescue this?
+                    if isinstance(self.workflow_config, dict):
+                        container_type_str = self.workflow_config.get("containerType")
+                        if container_type_str is not None:
+                            self.explicit_container_type = True
+                            self.container_type_str = container_type_str
+
                     outputsM = workflow_meta.get("outputs")
                     if isinstance(outputsM, dict):
                         outputs = list(outputsM.values())
@@ -2999,25 +3200,27 @@ class WF:
                         self.default_actions = None
             except IOError as ioe:
                 config_unmarshalled = False
-                self.logger.debug(
+                self.logger.log(
+                    logging.WARNING if fail_ok else logging.ERROR,
                     "Marshalled config file {} I/O errors".format(
                         workflow_meta_filename
-                    )
+                    ),
                 )
                 if not fail_ok:
                     raise WFException("ERROR opening/reading config file") from ioe
             except TypeError as te:
                 config_unmarshalled = False
-                self.logger.debug(
+                self.logger.log(
+                    logging.WARNING if fail_ok else logging.ERROR,
                     "Marshalled config file {} unmarshalling errors".format(
                         workflow_meta_filename
-                    )
+                    ),
                 )
                 if not fail_ok:
                     raise WFException("ERROR unmarshalling config file") from te
             except Exception as e:
                 config_unmarshalled = False
-                self.logger.debug(
+                self.logger.exception(
                     "Marshalled config file {} misc errors".format(
                         workflow_meta_filename
                     )
@@ -3034,23 +3237,7 @@ class WF:
                     if not fail_ok:
                         raise WFException(errstr)
 
-                # This has been commented-out, as credentials should NEVER be kept!!!
-                #
-                # creds_file = os.path.join(self.metaDir, WORKDIR_SECURITY_CONTEXT_FILE)
-                # if os.path.exists(creds_file):
-                #     with open(creds_file, mode="r", encoding="utf-8") as scf:
-                #         self.creds_config = unmarshall_namedtuple(yaml.safe_load(scf, Loader=YAMLLoader))
-                # else:
-                #     self.creds_config = {}
-                #
-                # valErrors = config_validate(self.creds_config, self.SECURITY_CONTEXT_SCHEMA)
-                # if len(valErrors) > 0:
-                #     config_unmarshalled = False
-                #     errstr = f'ERROR in security context block {creds_file}: {valErrors}'
-                #     self.logger.error(errstr)
-                #     if not fail_ok:
-                #         raise WFException(errstr)
-                self.creds_config = dict()
+                self.vault = SecurityContextVault()
 
                 self.configMarshalled = datetime.datetime.fromtimestamp(
                     os.path.getctime(workflow_meta_filename), tz=datetime.timezone.utc
@@ -3179,10 +3366,50 @@ class WF:
                     self.engineDesc = stage["engineDesc"]
                     self.engineVer = stage["engineVer"]
                     self.materializedEngine = stage["materializedEngine"]
+                    if (
+                        self.materializedEngine is not None
+                        and stage["containers"] is not None
+                        and self.materializedEngine.containers is None
+                    ):
+                        self.materializedEngine = self.materializedEngine._replace(
+                            containers=stage["containers"]
+                        )
                     self.materializedParams = stage["materializedParams"]
                     self.materializedEnvironment = stage.get(
                         "materializedEnvironment", []
                     )
+
+                    # Trying to identify the right container type
+                    # for old staged directories
+                    if (
+                        not self.explicit_container_type
+                        and self.materializedEngine is not None
+                    ):
+                        guessed_container_type: "ContainerType"
+                        if (
+                            self.materializedEngine.containers is None
+                            or len(self.materializedEngine.containers) == 0
+                        ):
+                            if (
+                                self.materializedEngine.operational_containers is None
+                                or len(self.materializedEngine.operational_containers)
+                                == 0
+                            ):
+                                guessed_container_type = ContainerType.NoContainer
+                            else:
+                                guessed_container_type = (
+                                    self.materializedEngine.operational_containers[
+                                        0
+                                    ].type
+                                )
+                        else:
+                            guessed_container_type = self.materializedEngine.containers[
+                                0
+                            ].type
+
+                        self.container_type_str = guessed_container_type.value
+                        self.stagedSetup._replace(container_type=guessed_container_type)
+
                     self.containerEngineVersion = stage.get("containerEngineVersion")
                     self.containerEngineOs = stage.get("containerEngineOs")
                     if self.containerEngineOs is None:
@@ -3205,11 +3432,19 @@ class WF:
                 errmsg = "Error while unmarshalling content from stage state file {}. Reason: {}".format(
                     marshalled_stage_file, e
                 )
-                self.logger.debug(errmsg)
                 self.stageMarshalled = False
+                self.logger.exception(errmsg)
                 if fail_ok:
+                    self.logger.debug(errmsg)
                     return self.stageMarshalled
+                self.logger.exception(errmsg)
                 raise WFException(errmsg) from e
+
+            # Now, time to save the late changes
+            if not self.explicit_container_type and self.materializedEngine is not None:
+                self.explicit_container_type = True
+                self.workflow_config["containerType"] = self.container_type_str
+                self.marshallConfig(overwrite=True)
 
             self.stageMarshalled = datetime.datetime.fromtimestamp(
                 os.path.getctime(marshalled_stage_file), tz=datetime.timezone.utc
@@ -3322,25 +3557,104 @@ class WF:
 
                     self.stagedExecutions = []
                     for execution in executions:
+                        # We might need to learn where the metadata of this
+                        # specific execution is living
+                        outputsDir = execution.get("outputsDir", WORKDIR_OUTPUTS_RELDIR)
+                        absOutputMetaDir = os.path.join(
+                            self.metaDir, WORKDIR_OUTPUTS_RELDIR
+                        )
+                        if absOutputMetaDir != WORKDIR_OUTPUTS_RELDIR:
+                            jobOutputMetaDir = os.path.join(
+                                absOutputMetaDir, os.path.basename(outputsDir)
+                            )
+                        else:
+                            jobOutputMetaDir = absOutputMetaDir
+
+                        # For backward compatibility, let's find the
+                        # logfiles and generated charts
+                        logfile: "Optional[MutableSequence[RelPath]]" = execution.get(
+                            "logfile"
+                        )
+                        if not isinstance(logfile, list) or len(logfile) == 0:
+                            logfile = []
+                            for logfname in (
+                                WORKDIR_STDOUT_FILE,
+                                WORKDIR_STDERR_FILE,
+                                "log.txt",
+                            ):
+                                putative_fname = os.path.join(
+                                    jobOutputMetaDir, logfname
+                                )
+                                if os.path.exists(putative_fname):
+                                    logfile.append(
+                                        cast(
+                                            "RelPath",
+                                            os.path.relpath(
+                                                putative_fname, self.workDir
+                                            ),
+                                        )
+                                    )
+                                    continue
+
+                                if jobOutputMetaDir != absOutputMetaDir:
+                                    putative_fname = os.path.join(
+                                        absOutputMetaDir, logfname
+                                    )
+                                    if os.path.exists(putative_fname):
+                                        logfile.append(
+                                            cast(
+                                                "RelPath",
+                                                os.path.relpath(
+                                                    putative_fname, self.workDir
+                                                ),
+                                            )
+                                        )
+
+                        diagram: "Optional[RelPath]" = execution.get("diagram")
+                        if diagram is None:
+                            putative_diagram = os.path.join(
+                                jobOutputMetaDir,
+                                WORKDIR_STATS_RELDIR,
+                                STATS_DAG_DOT_FILE,
+                            )
+
+                            if os.path.exists(putative_diagram):
+                                diagram = cast(
+                                    "RelPath",
+                                    os.path.relpath(putative_diagram, self.workDir),
+                                )
+                            elif jobOutputMetaDir != absOutputMetaDir:
+                                putative_diagram = os.path.join(
+                                    absOutputMetaDir,
+                                    WORKDIR_STATS_RELDIR,
+                                    STATS_DAG_DOT_FILE,
+                                )
+                                if os.path.exists(putative_diagram):
+                                    diagram = cast(
+                                        "RelPath",
+                                        os.path.relpath(putative_diagram, self.workDir),
+                                    )
+
                         stagedExec = StagedExecution(
                             exitVal=execution["exitVal"],
                             augmentedInputs=execution["augmentedInputs"],
                             matCheckOutputs=execution["matCheckOutputs"],
-                            outputsDir=execution.get(
-                                "outputsDir", WORKDIR_OUTPUTS_RELDIR
-                            ),
+                            outputsDir=outputsDir,
                             started=execution.get("started", executionMarshalled),
                             ended=execution.get("ended", executionMarshalled),
+                            logfile=logfile,
+                            diagram=diagram,
                         )
                         self.stagedExecutions.append(stagedExec)
             except Exception as e:
                 errmsg = "Error while unmarshalling content from execution state file {}. Reason: {}".format(
                     marshalled_execution_file, e
                 )
-                self.logger.debug(errmsg)
                 self.executionMarshalled = False
                 if fail_ok:
+                    self.logger.debug(errmsg)
                     return self.executionMarshalled
+                self.logger.exception(errmsg)
                 raise WFException(errmsg) from e
 
             self.executionMarshalled = datetime.datetime.fromtimestamp(
@@ -3438,10 +3752,12 @@ class WF:
 
             except Exception as e:
                 errmsg = f"Error while unmarshalling content from export results state file {marshalled_export_file}. Reason: {e}"
-                self.logger.debug(e)
                 self.exportMarshalled = False
                 if fail_ok:
+                    self.logger.debug(errmsg)
                     return self.exportMarshalled
+                else:
+                    self.logger.exception(errmsg)
                 raise WFException(errmsg) from e
 
             self.exportMarshalled = datetime.datetime.fromtimestamp(
@@ -3465,6 +3781,7 @@ class WF:
         items: "Sequence[ExportItem]",
         licences: "Sequence[str]" = [],
         orcids: "Sequence[str]" = [],
+        crate_pid: "Optional[str]" = None,
     ) -> "Sequence[AnyContent]":
         """
         The located paths in the contents should be relative to the working directory
@@ -3691,6 +4008,7 @@ class WF:
                     payloads=self.ExportROCrate2Payloads[item.block],
                     licences=licences,
                     orcids=orcids,
+                    crate_pid=crate_pid,
                 )
                 retval.append(
                     MaterializedContent(
@@ -3721,6 +4039,7 @@ class WF:
         payloads: "CratableItem" = NoCratableItem,
         licences: "Sequence[str]" = [],
         orcids: "Sequence[str]" = [],
+        crate_pid: "Optional[str]" = None,
     ) -> "AnyPath":
         """
         Create RO-crate from stage provenance.
@@ -3755,6 +4074,10 @@ class WF:
             payloads=payloads,
             licences=licences,
             orcids=the_orcids,
+            progs=self.wfexs.progs,
+            tempdir=self.tempDir,
+            scheme_desc=self.wfexs.describeFetchableSchemes(),
+            crate_pid=crate_pid,
         )
 
         wrroc.addWorkflowInputs(
@@ -3786,11 +4109,11 @@ class WF:
         payloads: "CratableItem" = NoCratableItem,
         licences: "Sequence[str]" = [],
         orcids: "Sequence[str]" = [],
+        crate_pid: "Optional[str]" = None,
     ) -> "AnyPath":
         """
         Create RO-crate from stage provenance.
         """
-        # TODO: implement deserialization
         self.unmarshallExecute(offline=True, fail_ok=True)
 
         assert self.localWorkflow is not None
@@ -3819,6 +4142,10 @@ class WF:
             payloads=payloads,
             licences=licences,
             orcids=the_orcids,
+            progs=self.wfexs.progs,
+            tempdir=self.tempDir,
+            scheme_desc=self.wfexs.describeFetchableSchemes(),
+            crate_pid=crate_pid,
         )
 
         for stagedExec in self.stagedExecutions:

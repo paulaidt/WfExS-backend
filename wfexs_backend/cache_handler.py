@@ -63,7 +63,6 @@ if TYPE_CHECKING:
         AnyURI,
         Fingerprint,
         ProgsMapping,
-        ProtocolFetcher,
         RelPath,
         SecurityContextConfig,
         WritableSecurityContextConfig,
@@ -72,6 +71,10 @@ if TYPE_CHECKING:
 
     from .fetchers import (
         StatefulFetcher,
+    )
+
+    from .security_context import (
+        SecurityContextVault,
     )
 
     class RelAbsDict(TypedDict):
@@ -108,11 +111,13 @@ from .common import (
     ContentKind,
     DefaultNoLicenceTuple,
     LicensedURI,
+    META_JSON_POSTFIX,
     URIWithMetadata,
 )
 
 from .fetchers import (
     AbstractStatefulFetcher,
+    DocumentedProtocolFetcher,
     FetcherException,
     FetcherInstanceException,
     InvalidFetcherException,
@@ -137,9 +142,7 @@ class CachedContent(NamedTuple):
     path: "AbsPath"
     metadata_array: "Sequence[URIWithMetadata]"
     licences: "Tuple[URIType, ...]"
-
-
-META_JSON_POSTFIX = "_meta.json"
+    fingerprint: "Optional[Fingerprint]" = None
 
 
 class CacheHandlerException(AbstractWfExSException):
@@ -160,7 +163,7 @@ class SchemeHandlerCacheHandler:
     def __init__(
         self,
         cacheDir: "AbsPath",
-        schemeHandlers: "Mapping[str, ProtocolFetcher]" = dict(),
+        schemeHandlers: "Mapping[str, DocumentedProtocolFetcher]" = dict(),
     ):
         # Getting a logger focused on specific classes
         import inspect
@@ -173,12 +176,12 @@ class SchemeHandlerCacheHandler:
 
         # TODO: create caching database
         self.cacheDir = cacheDir
-        self.schemeHandlers: "MutableMapping[str, ProtocolFetcher]" = dict()
+        self.schemeHandlers: "MutableMapping[str, DocumentedProtocolFetcher]" = dict()
 
         self.addRawSchemeHandlers(schemeHandlers)
 
     def addRawSchemeHandlers(
-        self, schemeHandlers: "Mapping[str, ProtocolFetcher]"
+        self, schemeHandlers: "Mapping[str, DocumentedProtocolFetcher]"
     ) -> None:
         # No validation is done here about validness of schemes
         if isinstance(schemeHandlers, dict):
@@ -189,7 +192,7 @@ class SchemeHandlerCacheHandler:
     def addSchemeHandler(
         self,
         scheme: "str",
-        handler: "Union[Type[StatefulFetcher], ProtocolFetcher]",
+        handler: "Union[Type[StatefulFetcher], DocumentedProtocolFetcher]",
         progs: "ProgsMapping" = dict(),
         setup_block: "Optional[Mapping[str, Any]]" = None,
     ) -> None:
@@ -198,14 +201,17 @@ class SchemeHandlerCacheHandler:
         :param scheme:
         :param handler:
         """
-        the_handler: "ProtocolFetcher"
+        the_handler: "DocumentedProtocolFetcher"
         if inspect.isclass(handler):
             inst_handler = self.instantiateStatefulFetcher(
                 handler, progs=progs, setup_block=setup_block
             )
-            the_handler = inst_handler.fetch
-        elif isinstance(
-            handler,
+            the_handler = DocumentedProtocolFetcher(
+                fetcher=inst_handler.fetch,
+                description=inst_handler.description,
+            )
+        elif isinstance(handler, DocumentedProtocolFetcher) and isinstance(
+            handler.fetcher,
             (
                 types.FunctionType,
                 types.LambdaType,
@@ -223,7 +229,8 @@ class SchemeHandlerCacheHandler:
         self.schemeHandlers[scheme.lower()] = the_handler
 
     def addSchemeHandlers(
-        self, schemeHandlers: "Mapping[str, ProtocolFetcher]"
+        self,
+        schemeHandlers: "Mapping[str, Union[Type[StatefulFetcher], DocumentedProtocolFetcher]]",
     ) -> None:
         # No validation is done here about validness of schemes
         if isinstance(schemeHandlers, dict):
@@ -262,8 +269,11 @@ class SchemeHandlerCacheHandler:
 
         return cast("StatefulFetcher", instStatefulFetcher)
 
-    def getRegisteredSchemes(self) -> "Sequence[str]":
-        return list(self.schemeHandlers.keys())
+    def describeRegisteredSchemes(self) -> "Sequence[Tuple[str, str]]":
+        return [
+            (scheme, desc_fetcher.description)
+            for scheme, desc_fetcher in self.schemeHandlers.items()
+        ]
 
     def _genUriMetaCachedFilename(
         self, hashDir: "AbsPath", the_remote_file: "URIType"
@@ -815,7 +825,8 @@ class SchemeHandlerCacheHandler:
         destdir: "Optional[AbsPath]" = None,
         ignoreCache: "bool" = False,
         registerInCache: "bool" = True,
-        secContext: "Optional[SecurityContextConfig]" = None,
+        vault: "Optional[SecurityContextVault]" = None,
+        sec_context_name: "Optional[str]" = None,
     ) -> "CachedContent":
         if destdir is None:
             destdir = self.cacheDir
@@ -870,10 +881,16 @@ class SchemeHandlerCacheHandler:
         metadata_array = []
         licences: "MutableSequence[URIType]" = []
         # The security context could be augmented, so avoid side effects
-        currentSecContext = dict() if secContext is None else copy.copy(secContext)
+        if vault is not None and sec_context_name is not None:
+            # TODO: revise this
+            secContext = vault.getContext("", sec_context_name)
+            currentSecContext = copy.copy(secContext)
+        else:
+            currentSecContext = dict()
 
         relFinalCachedFilename: "Optional[RelPath]"
         finalCachedFilename: "Optional[AbsPath]"
+        final_fingerprint: "Optional[Fingerprint]"
         while not isinstance(inputKind, ContentKind):
             # These elements are alternative URIs. Any of them should
             # provide the very same content
@@ -931,7 +948,7 @@ class SchemeHandlerCacheHandler:
                     or os.stat(uriMetaCachedFilename).st_size == 0
                 )
 
-                metaStructure = None
+                metaStructure: "Optional[CacheMetadataDict]" = None
                 if not refetch:
                     try:
                         metaStructure = self._parseMetaStructure(uriMetaCachedFilename)
@@ -996,6 +1013,11 @@ class SchemeHandlerCacheHandler:
                     )
                     if attachedSecContext is not None:
                         usableSecContext.update(attachedSecContext)
+                    elif vault is not None:
+                        # Getting context by URI prefix
+                        prefixSecContext = vault.getContext(the_remote_file)
+                        if prefixSecContext is not None:
+                            usableSecContext.update(prefixSecContext)
 
                     uncachedInputs.append(
                         (
@@ -1007,7 +1029,7 @@ class SchemeHandlerCacheHandler:
                     )
 
             if metaStructure is not None:
-                fetched_metadata_array = list(
+                cached_fetched_metadata_array = list(
                     map(
                         lambda rm: URIWithMetadata(
                             uri=rm["uri"],
@@ -1021,8 +1043,10 @@ class SchemeHandlerCacheHandler:
                 the_licences = metaStructure.get("licences", tuple())
 
                 # Store the metadata
-                metadata_array.extend(fetched_metadata_array)
+                metadata_array.extend(cached_fetched_metadata_array)
                 licences.extend(the_licences)
+                if "fingerprint" in metaStructure:
+                    final_fingerprint = metaStructure["fingerprint"]
             elif offline:
                 # As this is a handler for online resources, comply with offline mode
                 raise CacheOfflineException(
@@ -1056,7 +1080,17 @@ class SchemeHandlerCacheHandler:
 
                         try:
                             # Content is fetched here
-                            inputKind, fetched_metadata_array, fetched_licences = schemeHandler(the_remote_file, tempCachedFilename, secContext=usableSecContext if usableSecContext else None)  # type: ignore
+                            (
+                                inputKind,
+                                fetched_metadata_array,
+                                fetched_licences,
+                            ) = schemeHandler.fetcher(
+                                the_remote_file,
+                                tempCachedFilename,
+                                secContext=usableSecContext
+                                if usableSecContext
+                                else None,
+                            )
 
                             # Overwrite the licence if it is explicitly returned
                             if fetched_licences is not None:
@@ -1071,6 +1105,7 @@ class SchemeHandlerCacheHandler:
                                 tempCachedFilename=tempCachedFilename,
                                 inputKind=inputKind,
                             )
+                            final_fingerprint = fingerprint
 
                             # Now, creating the symlink
                             # (which should not be needed in the future)
@@ -1147,4 +1182,5 @@ class SchemeHandlerCacheHandler:
             path=finalCachedFilename,
             metadata_array=metadata_array,
             licences=tuple(licences),
+            fingerprint=final_fingerprint,
         )
